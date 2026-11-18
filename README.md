@@ -76,27 +76,41 @@ py -m client.cli --port 5050 --data client_data\alice
 py -m client.cli --port 5050 --data client_data\bob
 ```
 
-Then, in the client windows:
+Then sign up in each window and start chatting:
 
 ```text
 (not logged in) > signup alice          # in Alice's window; asks for a password twice
 (not logged in) > signup bob            # in Bob's window
 (bob) > users                           # list users and their key fingerprints
-(bob) > verbose on                      # print every crypto step
-(bob) > send alice Meeting moved to 3pm
-(alice) > verbose on
-(alice) > inbox                         # verify, then decrypt
-(alice) > logout
-(not logged in) > login alice
-(alice) > quit
+(bob) > chat alice                      # in Bob's window
+(alice) > chat bob                      # in Alice's window
 ```
+
+Inside `chat`, just type and press Enter. The other person's messages appear by
+themselves as they arrive (the client checks for new messages every second, and
+verifies and decrypts each one before showing it):
+
+```text
+--- Chat with alice ---
+    alice's key fingerprint: E448 7A25 635F B825 D308 5F2D 9020 ACE3
+    Every message is encrypted for them and signed by you. Type /exit to leave.
+
+bob> hi alice, meeting moved to 3pm
+[15:02] alice: ok, see you then
+bob> /exit
+--- Left chat with alice ---
+```
+
+Next time, use `login alice` instead of `signup`. Messages sent while you were away
+show up when you open the chat (or with `inbox`).
 
 | Command | What it does |
 |---|---|
 | `signup <username>` | Makes two key pairs on this computer, sends only the public keys and the password to the server, saves the private keys encrypted. |
 | `login <username>` | Server checks the password; client unlocks the private keys with it. |
 | `users` | Lists other users with a fingerprint of their public keys. |
-| `send <recipient> <message>` | Encrypts, signs, and sends. |
+| `chat <username>` | Live conversation. Type to send; incoming messages appear as they arrive. `/exit` leaves. |
+| `send <recipient> <message>` | Encrypts, signs, and sends a single message. |
 | `inbox` | Fetches new messages; verifies each signature, then decrypts. |
 | `verbose on` / `verbose off` | Show or hide each crypto step. |
 | `logout`, `quit` | |
@@ -395,7 +409,7 @@ would use a proper database.
 ```text
 secure-chat/
 ├── client/
-│   ├── cli.py          interactive shell (signup, login, users, send, inbox, logout)
+│   ├── cli.py          interactive shell (signup, login, users, chat, send, inbox, logout)
 │   ├── session.py      key files, key pinning, replay list, send/receive logic
 │   └── connection.py   JSON-over-TCP connection
 ├── server/

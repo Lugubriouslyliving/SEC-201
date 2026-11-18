@@ -6,7 +6,8 @@ Commands:
     signup <username>          create an account (asks for a password)
     login <username>           log in (asks for a password)
     users                      list other users and their key fingerprints
-    send <recipient> <message> encrypt, sign and send
+    chat <username>            live conversation: type to send, replies appear as they arrive
+    send <recipient> <message> encrypt, sign and send one message
     inbox                      fetch, verify and decrypt new messages
     verbose on|off             print each crypto step as it happens
     logout
@@ -17,6 +18,8 @@ import argparse
 import cmd
 import datetime
 import getpass
+import sys
+import threading
 
 from .connection import ConnectionError_
 from .session import ChatClient, ClientError
@@ -33,7 +36,13 @@ def silent(step, detail=""):
 
 
 class ChatShell(cmd.Cmd):
-    intro = "Secure chat client. Type 'help' for commands."
+    intro = (
+        "Secure chat client.\n"
+        "  New here?  signup <your name>      Returning?  login <your name>\n"
+        "  Then:      users                   to see who you can talk to\n"
+        "             chat <their name>       to start chatting\n"
+        "Type 'help' for all commands."
+    )
 
     def __init__(self, client: ChatClient):
         super().__init__()
@@ -115,6 +124,73 @@ class ChatShell(cmd.Cmd):
             else:
                 print(f"  !! REJECTED message claiming to be from {r['sender']} ({when})")
                 print(f"     reason: {r['reason']}")
+
+    def do_chat(self, arg):
+        """chat <username>  - live conversation; type /exit to leave"""
+        peer = arg.strip()
+        if not peer:
+            print("Usage: chat <username>   (type 'users' to see who is here)")
+            return
+        if self.client.username is None:
+            raise ClientError("Please log in first.")
+        if peer == self.client.username:
+            raise ClientError("You cannot chat with yourself.")
+        info = self.client._trusted_keys(peer)  # raises if unknown or if the key changed
+
+        me = self.client.username
+        prompt = f"{me}> "
+        print(f"--- Chat with {peer} ---")
+        print(f"    {peer}'s key fingerprint: {info['fingerprint']}")
+        print("    Every message is encrypted for them and signed by you. Type /exit to leave.")
+        print()
+
+        print_lock = threading.Lock()
+        stop = threading.Event()
+
+        def show(text):
+            # Print above the prompt, then redraw the prompt.
+            with print_lock:
+                sys.stdout.write("\r" + " " * (len(prompt) + 40) + "\r")
+                sys.stdout.write(text + "\n" + prompt)
+                sys.stdout.flush()
+
+        def receive_loop():
+            # Check the inbox once a second; verify and decrypt whatever arrived.
+            while not stop.is_set():
+                try:
+                    for r in self.client.inbox():
+                        when = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%H:%M") \
+                            if isinstance(r["timestamp"], int) else "--:--"
+                        if not r["ok"]:
+                            show(f"[{when}] !! REJECTED a message claiming to be from {r['sender']}: {r['reason']}")
+                        elif r["sender"] == peer:
+                            show(f"[{when}] {peer}: {r['text']}")
+                        else:
+                            show(f"[{when}] (from {r['sender']}) {r['text']}")
+                except (ClientError, ConnectionError_) as exc:
+                    show(f"!! could not check messages: {exc}")
+                stop.wait(1.0)
+
+        listener = threading.Thread(target=receive_loop, daemon=True)
+        listener.start()
+        try:
+            while True:
+                line = input(prompt)
+                text = line.strip()
+                if text in ("/exit", "/quit", "/back"):
+                    break
+                if not text:
+                    continue
+                try:
+                    self.client.send(peer, text)
+                except ClientError as exc:
+                    show(f"!! not sent: {exc}")
+        except (EOFError, KeyboardInterrupt):
+            print()
+        finally:
+            stop.set()
+            listener.join(timeout=5)
+        print(f"--- Left chat with {peer} ---")
 
     def do_verbose(self, arg):
         """verbose on|off  - show every crypto step"""
