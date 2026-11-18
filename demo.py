@@ -1,6 +1,6 @@
 """Guided demonstration: every protection, step by step, in the terminal.
 
-Run:  py demo.py            (all scenarios)
+Run:  py demo.py            (all eight scenarios)
       py demo.py --pause    (wait for Enter between scenarios, good for presenting)
 
 The demo starts its own server on a free port with a throwaway database in
@@ -13,13 +13,18 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 
+from client.connection import ConnectionError_
 from client.session import ChatClient, ClientError
 from crypto_utils.encoding import b64d
 from crypto_utils.keys import UserKeys
 from crypto_utils.messages import decrypt_without_signature_check, encrypt_and_sign, OAEP
-from server.server import start_in_background
+from crypto_utils.passwords import client_password_hash
+from crypto_utils.tls import generate_server_tls, server_context
+from server.server import ChatApp, ThreadedServer, start_in_background
+from tests.mitm import RecordingProxy
 
 PASSWORDS = {"alice": "alice-correct-horse", "bob": "bob-battery-staple", "eve": "eve-evil-password"}
 
@@ -68,7 +73,7 @@ def main():
 
     def new_client(name):
         # Each user gets their own data folder, as if on their own computer.
-        return ChatClient(host, port, os.path.join(workdir, f"device-{name}"), trace=quiet)
+        return ChatClient(host, port, os.path.join(workdir, f"device-{name}"), trace=quiet, ca_file=srv.ca_file)
 
     try:
         # ------------------------------------------------------------ setup
@@ -230,12 +235,49 @@ def main():
             print("     RSA-OAEP decryption failed again.")
         print("     Only Alice's private key works, and it lives encrypted on her device.")
 
-        banner("DONE: all seven scenarios behaved as expected")
+        # ------------------------------------------------------------ 8
+        banner("8. EAVESDROPPER TEST: someone records all network traffic (TLS 1.3)")
+        proxy = RecordingProxy(host, port)
+        print(f"   spy | recording every byte between Bob and the server (proxy port {proxy.port})")
+        bob2 = ChatClient("127.0.0.1", proxy.port, os.path.join(workdir, "device-bob"),
+                          trace=quiet, ca_file=srv.ca_file)
+        print(f"   bob | connected: {bob2.conn.tls_version}, {bob2.conn.cipher}, server certificate verified")
+        bob2.login("bob", PASSWORDS["bob"])
+        bob2.send("alice", "Secret plan: launch on Friday")
+        bob2.close()
+        time.sleep(0.3)
+        seen = proxy.everything
+        proxy.close()
+        print(f"   spy | captured {len(seen)} bytes; first 48 as hex: {seen[5:53].hex()}")
+        login_hash = client_password_hash("bob", PASSWORDS["bob"])
+        for label, needle in [("Bob's password", PASSWORDS["bob"]), ("Bob's login hash", login_hash),
+                              ("the word 'password_hash'", "password_hash"), ("the username 'bob'", "bob"),
+                              ("the recipient 'alice'", "alice"), ("the message text", "Secret plan")]:
+            print(f"   spy | can I find {label + '?':<28} {needle.encode() in seen}")
+        print("        |     Without TLS, the login hash would be readable here and could be replayed")
+        print("        |     to log in as Bob. With TLS the spy only has random-looking bytes, and")
+        print("        |     replaying them fails because every TLS 1.3 connection uses fresh keys.")
+
+        print("\n   spy | now pretending to BE the server, with a certificate from my own CA:")
+        fake_dir = os.path.join(workdir, "attacker-tls")
+        fake_paths = generate_server_tls(fake_dir, ("localhost", "127.0.0.1"))
+        fake = ThreadedServer(("127.0.0.1", 0), ChatApp(os.path.join(fake_dir, "db.json")),
+                              server_context(fake_paths["cert"], fake_paths["key"]))
+        threading.Thread(target=fake.serve_forever, daemon=True).start()
+        try:
+            ChatClient("127.0.0.1", fake.server_address[1], os.path.join(workdir, "device-bob"),
+                       trace=quiet, ca_file=srv.ca_file)
+            print("  !! connected to the fake server (should not happen)")
+        except ConnectionError_ as exc:
+            print(f"   bob | {exc}")
+        finally:
+            fake.stop()
+
+        banner("DONE: all eight scenarios behaved as expected")
     finally:
         for c in list(locals().get("clients", {}).values()):
             c.close()
-        srv.shutdown()
-        srv.server_close()
+        srv.stop()
         shutil.rmtree(workdir, ignore_errors=True)
 
 

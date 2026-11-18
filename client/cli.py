@@ -21,8 +21,8 @@ import getpass
 import sys
 import threading
 
-from .connection import ConnectionError_
-from .session import ChatClient, ClientError
+from .connection import DEFAULT_CA_FILE, ConnectionError_
+from .session import ChatClient, ClientError, safe_display
 
 
 def print_step(step: str, detail: str = "") -> None:
@@ -64,7 +64,10 @@ class ChatShell(cmd.Cmd):
             print(f"Error: {exc}")
         except ConnectionError_ as exc:
             print(f"Connection problem: {exc}")
+            print("The client will now exit. Start the server if needed, then run the client again.")
             return True
+        except Exception as exc:  # a bug, not the user's fault: report it and keep the shell running
+            print(f"Unexpected error ({exc.__class__.__name__}: {exc}). The command was not completed.")
 
     def emptyline(self):
         pass
@@ -118,12 +121,13 @@ class ChatShell(cmd.Cmd):
         if not results:
             print("No new messages.")
         for r in results:
-            when = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S") if isinstance(r["timestamp"], int) else "?"
+            when = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S") if r["timestamp"] else "?"
+            sender = safe_display(r["sender"])[:40]
             if r["ok"]:
-                print(f"  [{when}] {r['sender']}: {r['text']}   (signature OK)")
+                print(f"  [{when}] {sender}: {safe_display(r['text'])}   (signature OK)")
             else:
-                print(f"  !! REJECTED message claiming to be from {r['sender']} ({when})")
-                print(f"     reason: {r['reason']}")
+                print(f"  !! REJECTED message claiming to be from {sender} ({when})")
+                print(f"     reason: {safe_display(r['reason'])}")
 
     def do_chat(self, arg):
         """chat <username>  - live conversation; type /exit to leave"""
@@ -156,19 +160,28 @@ class ChatShell(cmd.Cmd):
 
         def receive_loop():
             # Check the inbox once a second; verify and decrypt whatever arrived.
+            # Everything printed from a message goes through safe_display so a
+            # sender cannot inject fake lines or terminal escape codes.
             while not stop.is_set():
                 try:
                     for r in self.client.inbox():
                         when = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%H:%M") \
-                            if isinstance(r["timestamp"], int) else "--:--"
+                            if r["timestamp"] else "--:--"
+                        sender = safe_display(r["sender"])[:40]
                         if not r["ok"]:
-                            show(f"[{when}] !! REJECTED a message claiming to be from {r['sender']}: {r['reason']}")
+                            show(f"[{when}] !! REJECTED a message claiming to be from {sender}: "
+                                 f"{safe_display(r['reason'])}")
                         elif r["sender"] == peer:
-                            show(f"[{when}] {peer}: {r['text']}")
+                            show(f"[{when}] {peer}: {safe_display(r['text'])}")
                         else:
-                            show(f"[{when}] (from {r['sender']}) {r['text']}")
-                except (ClientError, ConnectionError_) as exc:
+                            show(f"[{when}] (from {sender}) {safe_display(r['text'])}")
+                except ConnectionError_ as exc:
+                    show(f"!! {exc}  Type /exit.")
+                    return  # nothing more can arrive on a dead connection
+                except ClientError as exc:
                     show(f"!! could not check messages: {exc}")
+                except Exception as exc:  # never let the listener die silently
+                    show(f"!! unexpected error while checking messages ({exc.__class__.__name__})")
                 stop.wait(1.0)
 
         listener = threading.Thread(target=receive_loop, daemon=True)
@@ -185,6 +198,9 @@ class ChatShell(cmd.Cmd):
                     self.client.send(peer, text)
                 except ClientError as exc:
                     show(f"!! not sent: {exc}")
+                except ConnectionError_ as exc:
+                    show(f"!! not sent: {exc}")
+                    break
         except (EOFError, KeyboardInterrupt):
             print()
         finally:
@@ -216,15 +232,27 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5050)
     parser.add_argument("--data", default="client_data", help="folder for this device's encrypted keys")
+    parser.add_argument("--ca", default=DEFAULT_CA_FILE,
+                        help="the server's CA certificate (copy of server_data\\tls\\ca.crt)")
     args = parser.parse_args()
     try:
-        client = ChatClient(args.host, args.port, args.data, trace=silent)
+        client = ChatClient(args.host, args.port, args.data, trace=silent, ca_file=args.ca)
     except ConnectionError_ as exc:
         print(exc)
-        print("Start the server first:  py -m server.server")
+        if "Cannot reach" in str(exc):
+            print("Start the server first:  py -m server.server")
         return
+    shell = ChatShell(client)
+    shell.intro = (f"Connected securely ({client.conn.tls_version}, {client.conn.cipher}); "
+                   "server identity verified.\n" + shell.intro)
     try:
-        ChatShell(client).cmdloop()
+        while True:
+            try:
+                shell.cmdloop()
+                break
+            except KeyboardInterrupt:  # Ctrl+C at the prompt: don't crash, explain how to leave
+                print("\n(Type 'quit' to exit.)")
+                shell.intro = None
     finally:
         client.close()
 

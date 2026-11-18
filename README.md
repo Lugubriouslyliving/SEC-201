@@ -7,8 +7,11 @@ server, and the server can never read them. Each message is:
 - **signed** with Ed25519, so the recipient knows who sent it and that nobody changed it,
 - **unique**, with a random message ID, so an old message cannot be replayed.
 
-Passwords are stored only as salted scrypt hashes. Private keys never leave the
-user's computer and are encrypted on disk with a key derived from the password.
+Passwords never leave the user's computer: the client sends a scrypt hash, and the
+server stores that only after salting and hashing it again. Private keys never leave
+the user's computer and are encrypted on disk with a key derived from the password.
+The whole client-server connection runs over TLS 1.3, and the client accepts only
+the server's own certificate.
 
 Every algorithm comes from the Python [`cryptography`](https://cryptography.io)
 library. Nothing cryptographic is written by hand.
@@ -61,7 +64,9 @@ All commands below are run from this folder (the one holding `README.md`).
 py -m server.server --port 5050
 ```
 
-The server writes its database to `server_data\db.json`.
+The server writes its database to `server_data\db.json`. On its first start it also
+creates its TLS certificates in `server_data\tls\` and prints the fingerprint of
+`ca.crt`. Clients started from this same folder find `ca.crt` automatically.
 
 **Window 2, Alice's client.** Each user gets their own `--data` folder, standing in
 for their own computer:
@@ -75,6 +80,26 @@ py -m client.cli --port 5050 --data client_data\alice
 ```powershell
 py -m client.cli --port 5050 --data client_data\bob
 ```
+
+Each client starts with `Connected securely (TLSv1.3, …); server identity verified.`
+
+**Chatting between two computers.** On the server computer, listen on the network
+and put the name or IP address clients will use into the certificate. Do this on the
+first start, or delete `server_data\tls` first so new certificates are made:
+
+```powershell
+py -m server.server --host 0.0.0.0 --hostname 192.168.1.20
+```
+
+Copy `server_data\tls\ca.crt` (only that file, never `server.key`) to the other
+computer, for example on a USB stick, and point the client at it:
+
+```powershell
+py -m client.cli --host 192.168.1.20 --ca C:\path\to\ca.crt --data client_data\bob
+```
+
+The client refuses to connect if the server's certificate was not issued by that CA
+for that address, so nobody on the network can pose as the server.
 
 Then sign up in each window and start chatting:
 
@@ -106,8 +131,8 @@ show up when you open the chat (or with `inbox`).
 
 | Command | What it does |
 |---|---|
-| `signup <username>` | Makes two key pairs on this computer, sends only the public keys and the password to the server, saves the private keys encrypted. |
-| `login <username>` | Server checks the password; client unlocks the private keys with it. |
+| `signup <username>` | Makes two key pairs on this computer, sends only the public keys and a hash of the password to the server, saves the private keys encrypted. |
+| `login <username>` | Sends a hash of the password for the server to check; the client unlocks the private keys with the password locally. |
 | `users` | Lists other users with a fingerprint of their public keys. |
 | `chat <username>` | Live conversation. Type to send; incoming messages appear as they arrive. `/exit` leaves. |
 | `send <recipient> <message>` | Encrypts, signs, and sends a single message. |
@@ -119,7 +144,8 @@ Passwords are typed with `getpass`, so they are not shown on screen.
 
 ## 3. Running the demo and tests
 
-**Guided demo**, all seven scenarios with each step printed:
+**Guided demo**, eight scenarios with each step printed (the seven required ones
+plus a network eavesdropper):
 
 ```powershell
 py demo.py
@@ -134,11 +160,46 @@ py demo.py --pause
 The demo starts its own server on a free port with a temporary database and deletes
 it at the end, so it does not touch `server_data` or `client_data`.
 
-**Automated tests** (22 tests, about 5 seconds):
+**Automated tests** (68 tests, about 70 seconds):
 
 ```powershell
 py -m unittest -v
 ```
+
+The tests are in three files:
+
+- `tests/test_security.py` (25 tests) checks that each protection works: the seven
+  scenarios below, unit tests of the crypto code, and two password checks: every
+  request the server receives during signup and login is recorded and searched for
+  the real password (never found), and failed logins leave nothing in the server log.
+- `tests/test_tls.py` (9 tests) plays a network attacker:
+
+| Attack | Result |
+|---|---|
+| Record every byte of signup, login, user list and a message through a proxy (`tests/mitm.py`) | None of the password, login hash, usernames, field names, public keys or message text appear in the recording |
+| Replay the recorded login bytes to the server | Not a single request reaches the application |
+| Run a complete fake chat server with a certificate from the attacker's own CA | Client refuses with a security warning before sending anything |
+| Certificate issued for a different host name | Refused |
+| A server that does not speak TLS | Refused; only a TLS greeting was sent |
+| Connect with TLS 1.2 | Refused; TLS 1.3 only |
+| Missing or junk `ca.crt` | Clear error |
+| The CA's private key | Not stored anywhere |
+
+- `tests/test_edge_cases.py` (34 tests) checks that the app keeps working under
+  extreme or hostile conditions:
+
+| Area | What is thrown at it |
+|---|---|
+| Protocol abuse | Non-JSON, invalid UTF-8, arrays, `null`, 100,000-level nesting, `NaN`, unknown/list/object actions, missing or wrong-typed fields, requests over 1 MB, 200 requests on one connection, half-sent requests and half-finished TLS handshakes then disconnects, plain-text JSON sent to the TLS port, a client that connects and says nothing (dropped after the handshake timeout). The server answers or drops each one and keeps serving. |
+| Fake keys | Signing up with junk "PEM" text, a list, a number, or the wrong key type in each slot. Refused. |
+| Absurd packages | Timestamps of 10³⁰⁰, −1, `true`, a float; 10,000-character message IDs; list recipients. Refused. |
+| Hostile senders | A real user signs packages with junk inside (invalid base64, wrong sizes, ciphertext that decrypts to invalid UTF-8). The recipient rejects each one cleanly and keeps chatting. |
+| Display injection | A message containing a newline plus a fake `[12:00] bob:` line and terminal escape codes. Shown as visible `\n` / `\x1b`, so it cannot fake a line or clear the screen. |
+| Message content | Thai, emoji, Arabic, Japanese, NUL bytes, tabs, a single space; the maximum size (20,000 Thai characters); one character over the limit (refused before sending). |
+| Accounts | Invalid usernames and short passwords (refused instantly, before key generation), duplicates, 1,024-character and Thai/emoji passwords, a 500,000-character password over the raw protocol. |
+| Local files | Damaged or empty key file (clear error), damaged pinned-keys and seen-IDs files (moved aside, chat continues), logging in from a device without keys. |
+| Load | 10 users each sending 20 messages at the same moment (all 200 arrive exactly once, database stays valid); 20 simultaneous logins; chat-mode polling and sending on one connection. |
+| Failures | Server killed mid-session (client says so clearly, no crash); restart (messages and replay list survive); sender's clock an hour off (clear "check your clock" error); database wiped and an impostor registers the same name (pinned keys refuse the impostor). |
 
 What each required scenario looks like, and where it is tested:
 
@@ -151,14 +212,17 @@ What each required scenario looks like, and where it is tested:
 | 5 | Replay | Resending a captured message: the server rejects the duplicate ID. If a malicious server redelivers it anyway, Alice's client rejects it too, even after a restart | 5 | `test_5a_…`, `test_5b_…`, `test_5c_…` |
 | 6 | Wrong password | Wrong password and unknown username give the identical message `Invalid username or password.` and take about the same time | 6 | `test_6_login_failures_look_identical` |
 | 7 | Database leak | Logging in with the stolen hash/salt fails. The stolen messages cannot be opened with any key but Alice's, and the database has no private keys | 7 | `test_7a_…`, `test_7b_…` |
+| 8 | Eavesdropper (extra) | A spy records Bob's login and message: no password, login hash, name or text in the bytes. Then the spy poses as the server with its own certificate: Bob's client refuses | 8 | `tests/test_tls.py` |
 
 ## 4. How a message travels: Bob sends to Alice
 
 ```text
  BOB'S COMPUTER                     SERVER                         ALICE'S COMPUTER
  ──────────────                     ──────                         ────────────────
- login  ───── username+password ──▶ scrypt(password, salt)
-                                    == stored hash? (constant time)
+ h = scrypt(password,
+      salt from username)
+ login  ───── username + h ───────▶ scrypt(h, random salt)
+   (password never sent)            == stored hash? (constant time)
  users  ◀──── alice's public keys ── (public keys only)
 
  1 aes_key = 32 random bytes
@@ -195,10 +259,17 @@ The code for steps 1-3 is `encrypt_and_sign` and for steps 5-8 is
 
 ### Security (access control and secrets at rest)
 
-- **Passwords are hashed and salted.** The server stores `scrypt(password, salt)` with
-  a fresh 16-byte random salt per user, never the password. Login recomputes the hash
-  and compares with `hmac.compare_digest`, which takes the same time wherever the
-  bytes differ. Passwords are never written to logs.
+- **The password never leaves your computer.** The client sends a *login hash*
+  instead: `h = scrypt(password, salt = SHA-256("secure-chat/login-hash/v1:" + username))`.
+  The server, its log and anyone watching the network never see the password itself.
+- **Passwords are hashed and salted (again) on the server.** The server stores
+  `scrypt(h, salt)` with a fresh 16-byte random salt per user. Login recomputes it and
+  compares with `hmac.compare_digest`, which takes the same time wherever the bytes
+  differ. The server refuses anything that is not a proper 32-byte login hash, so it
+  can never end up storing a plain password.
+- **Nothing about failed logins is logged.** A failed login's "username" is whatever
+  was typed, and people sometimes type their password into that box. The server log
+  records only successful logins and signups.
 - **Private keys are protected at rest.** Each client stores its private keys
   encrypted with AES-256-GCM under a key derived from the password by scrypt with its
   own salt. A stolen laptop gives the thief an encrypted file, not keys.
@@ -229,10 +300,25 @@ The code for steps 1-3 is `encrypt_and_sign` and for steps 5-8 is
 
 ## 6. Protocol
 
-**Transport:** TCP. Each request and each response is one JSON object on one line,
+**Transport:** TLS 1.3 over TCP (older TLS versions are refused). The client trusts
+only the server's private CA (`server_data\tls\ca.crt`), not the computer's usual
+list of public CAs, and checks the certificate matches the host name it connected
+to. Inside TLS, each request and each response is one JSON object on one line,
 UTF-8, ending in `\n`. The client sends a request and waits for exactly one response.
-One TCP connection is one session: after `login` succeeds, that connection is
-"logged in" until `logout` or disconnect. Requests over 1 MB are refused.
+One TLS connection is one session: after `login` succeeds, that connection is
+"logged in" until `logout` or disconnect. Requests over 1 MB are refused, and a new
+connection has 15 seconds to finish the TLS handshake.
+
+The certificate files, made by `crypto_utils/tls.py` on the server's first start:
+
+| File | What it is | Where it goes |
+|---|---|---|
+| `ca.crt` | The private certificate authority (ECDSA P-256), valid 10 years | Copied to every client |
+| `server.crt` | The server's certificate, signed by the CA, for `localhost`, `127.0.0.1`, `::1` plus any `--hostname` | Stays on the server |
+| `server.key` | The server's TLS private key | Stays on the server, never copied |
+
+The CA's private key signs `server.crt` once and is then discarded, never written
+to disk.
 
 All binary values (keys, nonces, ciphertext, signatures) are base64. Public keys are
 PEM text.
@@ -241,14 +327,22 @@ Every response has `"ok": true` or `"ok": false, "error": "<message>"`.
 
 | Request | Needs login | Success response |
 |---|---|---|
-| `{"action":"signup","username":"alice","password":"…","enc_public_pem":"…","sign_public_pem":"…"}` | no | `{"ok":true,"username":"alice"}` (also logs in) |
-| `{"action":"login","username":"alice","password":"…"}` | no | `{"ok":true,"username":"alice"}` |
+| `{"action":"signup","username":"alice","password_hash":"…","enc_public_pem":"…","sign_public_pem":"…"}` | no | `{"ok":true,"username":"alice"}` (also logs in) |
+| `{"action":"login","username":"alice","password_hash":"…"}` | no | `{"ok":true,"username":"alice"}` |
 | `{"action":"users"}` (optional `"include_self":true`) | yes | `{"ok":true,"users":[{"username":"bob","enc_public_pem":"…","sign_public_pem":"…"}]}` |
 | `{"action":"send","package":{…}}` | yes | `{"ok":true,"msg_id":"…"}` |
 | `{"action":"inbox"}` | yes | `{"ok":true,"messages":[{…package…}]}` (undelivered ones, then marked delivered) |
 | `{"action":"logout"}` | no | `{"ok":true}` |
 
-Rules: usernames are 3-20 characters of `a-z 0-9 _`; passwords at least 8 characters.
+`password_hash` is the client's login hash: base64 of the 32-byte
+`scrypt(password, salt = SHA-256("secure-chat/login-hash/v1:" + username))`, with
+n=2^15, r=8, p=1. The server refuses anything else.
+
+Rules: usernames are 3-20 characters of `a-z 0-9 _`; passwords 8-1,024 characters
+(checked by the client, since the server never sees the password);
+public keys must parse as an RSA key of at least 2048 bits and an Ed25519 key;
+messages up to 20,000 characters (checked by the client). Any malformed request gets
+an `"ok": false` reply; the server never crashes or drops other users because of one.
 
 **The message package:**
 
@@ -284,7 +378,7 @@ recipient's job, because the recipient should not have to trust the server.
 
 | Attacker | What they can do | What protects you |
 |---|---|---|
-| Someone on the network | Read and change traffic between client and server | Message contents: encryption + signatures. *Not* login passwords: see "not protected" below |
+| Someone on the network | Read, record, change or replay traffic; pose as the server | TLS 1.3: they see only encrypted bytes (no password, login hash, names or envelopes) and cannot replay them. A fake server is refused because its certificate is not from our CA. Message contents are additionally end-to-end encrypted and signed |
 | The server operator, or someone who hacked the server | Read the whole database, change it, add or redeliver messages | Cannot read messages (no private keys). Cannot forge or change them (signatures). Replays caught by the client's message ID list |
 | Someone who steals the database | Has hashes, salts, public keys, ciphertext | Hashes cannot be used to log in; guessing passwords is slow (scrypt). Messages unreadable |
 | Another user (Eve) | Sign up, send messages, pretend to be someone else | Server refuses `sender` ≠ logged-in user; even if bypassed, the signature check fails |
@@ -295,24 +389,47 @@ recipient's job, because the recipient should not have to trust the server.
 - **Metadata is visible to the server:** who talks to whom, when, how often, and
   roughly how long each message is (AES-GCM does not hide length). Hiding this needs
   much heavier designs (mixnets, padding, onion routing).
-- **No TLS on the socket.** The login password travels to the server in plain text,
-  so a network eavesdropper could capture it. Message contents are still safe
-  (end-to-end encrypted), but in a real deployment the socket must be wrapped in TLS.
-  It is left out here to keep the protocol visible and simple.
+- **TLS is only as good as how `ca.crt` reaches the client.** If an attacker can swap
+  the `ca.crt` file you copy to a client, they can pose as the server. Copy it over a
+  channel you trust (USB stick, in person) and compare the fingerprint the server
+  prints at start-up.
+- **`server.key` is stored unencrypted** so the server can start without someone
+  typing a passphrase. Anyone who can read the server's folder can impersonate the
+  server on the network. (They still cannot read messages: those need the users'
+  private keys.) Protect the server computer, and delete `server_data\tls` to make
+  new certificates if it may have been copied.
+- **The login hash is a password-equivalent for the server.** TLS keeps it off the
+  network, but if malware on your computer or a malicious server operator captured it,
+  they could log in as you. They still could not read or sign your messages.
+- **Network observers still see traffic shape:** that your computer talks to the
+  server, when, and roughly how much. TLS hides content, not timing and volume.
 - **Trusting public keys.** The client gets public keys from the server. A malicious
   server could hand out its own key the *first* time you look someone up. The client
   pins each key the first time it sees it ("trust on first use") and refuses if the
   server later changes it, and `users` shows a fingerprint that two people can compare
   in person. Without that comparison, the very first lookup is trusted blindly.
-- **No forward secrecy.** If Alice's private key and password are stolen later, old
-  messages captured earlier can be decrypted. Protocols like Signal fix this with
-  short-lived keys (the Double Ratchet); that is beyond this demo.
+- **No forward secrecy for stored messages.** TLS 1.3 gives the *connection* forward
+  secrecy, so recorded network traffic stays unreadable even if a key leaks later.
+  But the server keeps the end-to-end encrypted packages, and if Alice's private key
+  and password are stolen later, those stored copies can be decrypted. Protocols like
+  Signal fix this with short-lived keys (the Double Ratchet); that is beyond this demo.
 - **Compromised endpoint.** Malware on Alice's or Bob's computer sees plaintext. No
   encryption helps there.
 - **No login rate limiting or account lockout**, and no "forgot password": losing the
   password means losing the private keys and the ability to read messages.
 - **Denial of service:** the server can delete or withhold messages. Signatures prove
-  what *arrived* is genuine; they cannot prove something *didn't* arrive.
+  what *arrived* is genuine; they cannot prove something *didn't* arrive. The server
+  also has no limit on the number of open connections or on idle time after login, so
+  a flood of connections could exhaust it. (It does limit request size to 1 MB,
+  passwords to 1,024 characters and the TLS handshake to 15 seconds, and runs at most
+  4 scrypt computations at once so a burst of logins cannot exhaust memory.)
+- **Scale:** the server rewrites its whole JSON database on every message. That is
+  fine for a classroom (thousands of messages) but not for real traffic, which would
+  need a proper database.
+- **Same account in two windows at once:** each new message is delivered to whichever
+  session checks first, so the other window does not see it. Use one window per user.
+- **No reconnect:** if the server restarts, clients say the connection was lost and
+  must be started again.
 - **Replay window on the client:** seen IDs are kept per device folder. A fresh device
   for the same user has no history (and also no keys, since keys live on the original
   device).
@@ -381,10 +498,59 @@ earlier the mismatch is. An attacker measuring response times could use that.
 Different errors let an attacker find out which usernames exist, then focus on them.
 One generic error, plus running scrypt even for unknown users, removes that clue.
 
+**Why TLS, when messages are already end-to-end encrypted?**
+The two layers protect different things. End-to-end encryption protects message
+*contents* from everyone, including the server. TLS protects the *connection*: the
+login hash (which an eavesdropper could otherwise replay to log in as you), usernames,
+the user list, and who sends to whom. TLS also proves to the client it reached the
+real server, which the end-to-end layer cannot do. Real messengers use both.
+
+**Why TLS 1.3 only?**
+TLS 1.3 removed the old, weak options: every connection uses a fresh key exchange
+(forward secrecy, which is also why replaying recorded bytes fails) and authenticated
+encryption. Allowing older versions would let an attacker try to push the connection
+down to them.
+
+**Why our own small certificate authority instead of a public one?**
+A public CA (like the ones websites use) needs a domain name and an internet-facing
+server; a classroom chat on `localhost` or a home network has neither. A private CA
+lets the server make its certificate on first start. The client trusts *only* this CA,
+not the hundreds of public CAs a computer normally trusts, so no outside certificate,
+however genuine, is accepted for this server.
+
+**Why throw away the CA's private key?**
+Whoever holds it can issue certificates that every client accepts. After it signs the
+server's certificate once, nothing needs it, so it is never saved. A thief who copies
+the server's folder therefore cannot mint new trusted certificates (though they can
+use `server.key` itself; see the threat model).
+
+**Why check the host name in the certificate?**
+Otherwise any certificate from our CA would do for any address. Checking the name
+means the certificate only works for the server it was made for.
+
+**Why hash the password on the client before sending it?**
+So the password itself never travels and the server never knows it. That matters for
+three reasons: people reuse passwords on other sites; the same password unlocks your
+private-key file, so a server that knew it could open that file if it ever got a copy;
+and a log line or a debugging print on the server cannot leak what it never received.
+
+**Why use the username as the client-side salt?**
+The client must produce the same hash on any computer, before talking to the server,
+so it cannot use a random salt it would have to look up. The username is unique per
+user, so it still stops one precomputed table from attacking everyone. The fixed
+"secure-chat/login-hash/v1" label keeps the hash unrelated to any other use of the
+password. The real random salt is added by the server's second scrypt.
+
+**Why hash again on the server?**
+If the server stored the login hash directly, a stolen database would contain exactly
+what you need to log in. Hashing it again with a random salt means the database holds
+`scrypt(h)`, which is useless for logging in.
+
 **Why a separate salt for the key file?**
-The server's password hash and the client's key-file key are both derived from the
-same password. Different salts make them unrelated, so the server's hash says nothing
-about the key that protects your private keys.
+The login hash and the client's key-file key are both derived from the same password.
+Different salts (one from the username, one random and stored in the key file) make
+them unrelated, so the login hash says nothing about the key that protects your
+private keys.
 
 **Why check replays in two places?**
 The server rejecting duplicate IDs stops most replays early. But the server is not
@@ -411,18 +577,22 @@ secure-chat/
 ├── client/
 │   ├── cli.py          interactive shell (signup, login, users, chat, send, inbox, logout)
 │   ├── session.py      key files, key pinning, replay list, send/receive logic
-│   └── connection.py   JSON-over-TCP connection
+│   └── connection.py   JSON-over-TLS connection, server certificate check
 ├── server/
-│   ├── server.py       threaded socket server, accounts, store-and-forward
+│   ├── server.py       threaded TLS server, accounts, store-and-forward
 │   └── storage.py      JSON database with atomic writes
 ├── crypto_utils/
-│   ├── passwords.py    scrypt password hashing + constant-time verify
+│   ├── passwords.py    client login hash + server scrypt hashing + constant-time verify
 │   ├── keys.py         RSA/Ed25519 key pairs, encrypted key file, fingerprints
 │   ├── messages.py     encrypt_and_sign / verify_and_decrypt
+│   ├── tls.py          private CA + server certificate, TLS 1.3 settings
 │   └── encoding.py     base64 and canonical JSON
 ├── tests/
-│   └── test_security.py  22 automated tests (unit + end-to-end over real sockets)
-├── demo.py             guided demonstration of all seven scenarios
+│   ├── test_security.py    25 tests: each protection (unit + end-to-end over real sockets)
+│   ├── test_edge_cases.py  34 tests: hostile input, extreme values, load, crashes, restarts
+│   ├── test_tls.py         9 tests: eavesdropping, replay, fake servers, TLS versions
+│   └── mitm.py             recording proxy used as the "eavesdropper"
+├── demo.py             guided demonstration of all eight scenarios
 ├── requirements.txt
 └── README.md
 ```

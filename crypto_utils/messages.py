@@ -164,7 +164,7 @@ def verify_and_decrypt(
     try:
         _check_shape(package)
     except (KeyError, TypeError, ValueError) as exc:
-        raise MessageRejected(f"malformed package ({exc})") from None
+        raise MessageRejected(f"malformed package ({str(exc)[:80]})") from None
 
     # --- Step 1: who sent this, and is it exactly what they sent?
     try:
@@ -206,11 +206,17 @@ def verify_and_decrypt(
     except InvalidTag:
         trace("DECRYPT", "AES-GCM authentication tag does NOT verify -> REJECT")
         raise MessageRejected("AES-GCM authentication failed: ciphertext or metadata was modified") from None
+    except ValueError:  # e.g. an AES key of the wrong length, wrapped by a hostile sender
+        raise MessageRejected("could not decrypt: the sender's package is malformed") from None
+    try:
+        text = plaintext.decode("utf-8")
+    except UnicodeDecodeError:
+        raise MessageRejected("decrypted content is not valid text") from None
     trace("DECRYPT", "AES-256-GCM tag verified, plaintext recovered")
 
     if seen_ids is not None:
         seen_ids.add(package["msg_id"])
-    return plaintext.decode("utf-8")
+    return text
 
 
 def decrypt_without_signature_check(package: dict, my_keys: UserKeys) -> str:
@@ -225,7 +231,12 @@ def decrypt_without_signature_check(package: dict, my_keys: UserKeys) -> str:
 
 
 def _check_shape(package: dict) -> None:
-    """Reject anything that is not a well-formed v1 package."""
+    """Reject anything that is not a well-formed v1 package.
+
+    This only parses; it trusts nothing. Every binary field must be valid
+    base64 of a sensible size, so nothing later can trip over junk, even
+    junk that its sender signed with a perfectly valid key.
+    """
     if not isinstance(package, dict):
         raise TypeError("package must be an object")
     for field in SIGNED_FIELDS + ("signature",):
@@ -233,10 +244,18 @@ def _check_shape(package: dict) -> None:
             raise KeyError(field)
     if package["version"] != VERSION:
         raise ValueError("unsupported version")
-    if not isinstance(package["timestamp"], int):
-        raise TypeError("timestamp must be an integer")
+    if type(package["timestamp"]) is not int or not 0 < package["timestamp"] < 2**40:
+        raise TypeError("timestamp must be a reasonable integer")
     for field in ("msg_id", "sender", "recipient", "nonce", "ciphertext", "wrapped_key", "signature"):
         if not isinstance(package[field], str):
             raise TypeError(f"{field} must be a string")
+    if not 1 <= len(package["msg_id"]) <= 64:
+        raise ValueError("bad message ID")
     if len(b64d(package["nonce"])) != 12:
         raise ValueError("nonce must be 96 bits")
+    if len(b64d(package["ciphertext"])) < 16:
+        raise ValueError("ciphertext shorter than a GCM tag")
+    if not b64d(package["wrapped_key"]):
+        raise ValueError("empty wrapped key")
+    if len(b64d(package["signature"])) != 64:
+        raise ValueError("Ed25519 signatures are 64 bytes")

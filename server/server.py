@@ -11,8 +11,13 @@ What it never does:
   * decrypt anything (it has no key that could)
   * store or log a plaintext password
 
-Protocol: TCP, one JSON object per line (UTF-8, terminated by "\\n").
-See README.md, section "Protocol".
+Protocol: TLS 1.3 over TCP, one JSON object per line (UTF-8, terminated
+by "\\n"). See README.md, section "Protocol". On first start the server
+creates its TLS certificates in server_data/tls (see crypto_utils/tls.py);
+clients need a copy of server_data/tls/ca.crt.
+
+Robustness rule: whatever a client sends, the server answers with an error
+and keeps running. One bad request never affects other users.
 
 Run:  py -m server.server --port 5050
 """
@@ -20,12 +25,18 @@ Run:  py -m server.server --port 5050
 import argparse
 import json
 import logging
+import os
 import re
+import socket
 import socketserver
+import ssl
+import sys
 import threading
 import time
 
-from crypto_utils.passwords import DUMMY_RECORD, hash_password, verify_password
+from crypto_utils.keys import load_enc_public, load_sign_public
+from crypto_utils.passwords import DUMMY_RECORD, hash_password, is_login_hash, verify_password
+from crypto_utils.tls import DEFAULT_HOSTNAMES, certificate_fingerprint, ensure_server_tls, server_context
 
 from .storage import Storage
 
@@ -33,38 +44,70 @@ log = logging.getLogger("server")
 log.addHandler(logging.NullHandler())  # silent unless main() configures logging
 
 USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
-MIN_PASSWORD_LEN = 8
 MAX_LINE = 1_000_000          # bytes; a request bigger than this is refused
+MAX_MSG_ID_LEN = 64
+MIN_RSA_BITS = 2048
 MAX_CLOCK_SKEW = 300          # seconds; package timestamps must be within this of server time
+HANDSHAKE_TIMEOUT = 15        # seconds a new connection gets to complete the TLS handshake
 GENERIC_LOGIN_ERROR = "Invalid username or password."  # same text for every login failure
+
+# scrypt needs ~32 MiB per computation. Without a limit, 1,000 simultaneous
+# logins would ask for ~32 GiB. At most this many run at once; the rest wait.
+SCRYPT_SLOTS = threading.BoundedSemaphore(4)
+
+PACKAGE_STRING_FIELDS = ("msg_id", "sender", "recipient", "nonce", "ciphertext", "wrapped_key", "signature")
 
 
 class RequestHandler(socketserver.StreamRequestHandler):
     """One instance per TCP connection. A connection is one client session."""
 
     def setup(self):
-        super().setup()
+        # TLS handshake first, in this connection's own thread, with a time
+        # limit, so a slow or non-TLS client cannot hold up anyone else. If it
+        # fails (plain-text client, wrong protocol, someone probing the port)
+        # the connection is simply dropped.
+        self.request.settimeout(HANDSHAKE_TIMEOUT)
+        self.request.do_handshake()
+        self.request.settimeout(None)  # a logged-in user may sit idle at the prompt
+        super().setup()  # (this is what sets self.connection = self.request)
         self.user = None  # set after a successful login/signup
+        self.server.track(self.connection)
+
+    def finish(self):
+        self.server.untrack(self.connection)
+        try:
+            super().finish()
+        except OSError:
+            pass  # client already gone
 
     def handle(self):
         peer = "%s:%s" % self.client_address
         log.info("connection from %s", peer)
+        try:
+            self._serve()
+        except OSError:
+            pass  # the client vanished mid-request (closed window, network drop): nothing to do
+        log.info("connection from %s closed", peer)
+
+    def _serve(self):
         while True:
             line = self.rfile.readline(MAX_LINE + 1)
             if not line:
-                break  # client closed the connection
+                return  # client closed the connection
             if len(line) > MAX_LINE:
                 self._reply({"ok": False, "error": "Request too large."})
-                break
+                return  # the rest of the oversized line is unreadable; end the session
+            if not line.strip():
+                self._reply({"ok": False, "error": "Empty request."})
+                continue
             try:
                 request = json.loads(line.decode("utf-8"))
                 if not isinstance(request, dict):
                     raise ValueError
-            except ValueError:
+            except (ValueError, RecursionError):  # bad UTF-8, bad JSON, absurd nesting
                 self._reply({"ok": False, "error": "Request must be one JSON object per line."})
                 continue
             self._reply(self.server.app.dispatch(self, request))
-        log.info("connection from %s closed", peer)
 
     def _reply(self, obj: dict) -> None:
         self.wfile.write(json.dumps(obj).encode("utf-8") + b"\n")
@@ -87,54 +130,71 @@ class ChatApp:
             "inbox": self.inbox,
             "logout": self.logout,
         }
-        if action not in handlers:
-            return {"ok": False, "error": f"Unknown action {action!r}."}
+        if not isinstance(action, str) or action not in handlers:
+            return {"ok": False, "error": "Unknown action."}
         if action in ("users", "send", "inbox") and conn.user is None:
             return {"ok": False, "error": "Please log in first."}
         try:
             return handlers[action](conn, req)
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
             return {"ok": False, "error": f"Bad request ({exc.__class__.__name__})."}
+        except Exception:  # a bug in the server: log it, keep running
+            log.exception("unexpected error handling %r", action)
+            return {"ok": False, "error": "Internal server error."}
 
     # ------------------------------------------------------------ accounts
 
     def signup(self, conn, req):
-        username, password = req["username"], req["password"]
+        # The client never sends the password itself, only its login hash
+        # (see crypto_utils/passwords.py). Password rules such as minimum
+        # length are therefore checked by the client.
+        username, login_hash = req["username"], req["password_hash"]
         enc_pem, sign_pem = req["enc_public_pem"], req["sign_public_pem"]
         if not isinstance(username, str) or not USERNAME_RE.match(username):
             return {"ok": False, "error": "Username must be 3-20 characters: a-z, 0-9, _."}
-        if not isinstance(password, str) or len(password) < MIN_PASSWORD_LEN:
-            return {"ok": False, "error": f"Password must be at least {MIN_PASSWORD_LEN} characters."}
-        if "BEGIN PUBLIC KEY" not in enc_pem or "BEGIN PUBLIC KEY" not in sign_pem:
-            return {"ok": False, "error": "Public keys must be PEM encoded."}
+        if not is_login_hash(login_hash):
+            return {"ok": False, "error": "password_hash must be the client's 32-byte login hash (base64)."}
+        # Check the public keys are real keys of the right type. Otherwise a
+        # user could register junk that breaks everyone who tries to message them.
+        try:
+            if not isinstance(enc_pem, str) or not isinstance(sign_pem, str):
+                raise ValueError
+            if load_enc_public(enc_pem).key_size < MIN_RSA_BITS:
+                raise ValueError
+            load_sign_public(sign_pem)
+        except Exception:
+            return {"ok": False, "error": "Public keys must be a PEM RSA key (2048+ bits) and a PEM Ed25519 key."}
 
-        record = hash_password(password)  # slow; done outside the lock
+        with SCRYPT_SLOTS:
+            record = hash_password(login_hash)  # salted again with a random salt; slow, so outside the lock
         with self.db.lock:
             if username in self.db.data["users"]:
                 return {"ok": False, "error": "That username is taken."}
             self.db.data["users"][username] = {
-                "password": record,  # salt + scrypt hash only
+                "password": record,  # scrypt(login hash, random salt) only
                 "enc_public_pem": enc_pem,
                 "sign_public_pem": sign_pem,
                 "created": int(time.time()),
             }
             self.db.save()
         conn.user = username
-        log.info("signup: %s", username)  # note: never log the password
+        log.info("signup: %s", username)
         return {"ok": True, "username": username}
 
     def login(self, conn, req):
-        username, password = req["username"], req["password"]
-        if not isinstance(username, str) or not isinstance(password, str):
+        username, login_hash = req["username"], req["password_hash"]
+        if not isinstance(username, str) or not is_login_hash(login_hash):
             return {"ok": False, "error": GENERIC_LOGIN_ERROR}
         with self.db.lock:
             user = self.db.data["users"].get(username)
         # Always run scrypt once, even for unknown users, so the reply time
         # does not reveal whether the username exists.
         record = user["password"] if user else DUMMY_RECORD
-        password_ok = verify_password(password, record)
+        with SCRYPT_SLOTS:
+            password_ok = verify_password(login_hash, record)
         if user is None or not password_ok:
-            log.info("login failed for %r", username)
+            # Deliberately NOT logged: a failed login's "username" is whatever was
+            # typed, and people sometimes type their password into that box.
             # One message for "no such user" and "wrong password".
             return {"ok": False, "error": GENERIC_LOGIN_ERROR}
         conn.user = username
@@ -154,7 +214,7 @@ class ChatApp:
                 {"username": name, "enc_public_pem": u["enc_public_pem"], "sign_public_pem": u["sign_public_pem"]}
                 for name, u in sorted(self.db.data["users"].items())
             ]
-        if req.get("include_self"):
+        if req.get("include_self") is True:
             return {"ok": True, "users": listing}
         return {"ok": True, "users": [u for u in listing if u["username"] != conn.user]}
 
@@ -164,20 +224,27 @@ class ChatApp:
         """Accept a sealed package. The server checks the envelope, never the contents."""
         pkg = req["package"]
         if not isinstance(pkg, dict):
-            raise TypeError
-        required = ("version", "msg_id", "sender", "recipient", "timestamp",
-                    "nonce", "ciphertext", "wrapped_key", "signature")
+            return {"ok": False, "error": "Package must be a JSON object."}
+        required = ("version", "timestamp") + PACKAGE_STRING_FIELDS
         missing = [f for f in required if f not in pkg]
         if missing:
             return {"ok": False, "error": f"Package is missing fields: {', '.join(missing)}."}
+        if not all(isinstance(pkg[f], str) for f in PACKAGE_STRING_FIELDS):
+            return {"ok": False, "error": "Package fields have the wrong type."}
+        if not 1 <= len(pkg["msg_id"]) <= MAX_MSG_ID_LEN:
+            return {"ok": False, "error": "Invalid message ID."}
 
         # The logged-in user may only send as themselves. (Recipients still
         # verify the signature: they must not have to trust the server.)
         if pkg["sender"] != conn.user:
-            log.warning("rejected: %s tried to send as %r", conn.user, pkg["sender"])
+            log.warning("rejected: %s tried to send as %r", conn.user, pkg["sender"][:40])
             return {"ok": False, "error": "Sender does not match the logged-in user."}
-        if not isinstance(pkg["timestamp"], int) or abs(time.time() - pkg["timestamp"]) > MAX_CLOCK_SKEW:
-            return {"ok": False, "error": "Timestamp is too old or too far in the future."}
+        ts = pkg["timestamp"]
+        # `type(...) is int` excludes True/False; the range check comes before any
+        # arithmetic so an enormous number cannot cause an overflow.
+        if type(ts) is not int or not 0 < ts < 2**40 or abs(time.time() - ts) > MAX_CLOCK_SKEW:
+            return {"ok": False, "error": "Message timestamp is more than 5 minutes away from the server's "
+                                          "time. Check that your computer's clock is correct."}
 
         with self.db.lock:
             if pkg["recipient"] not in self.db.data["users"]:
@@ -200,9 +267,12 @@ class ChatApp:
         with self.db.lock:
             out = []
             for entry in self.db.data["messages"]:
-                if entry["package"]["recipient"] == conn.user and not entry["delivered"]:
-                    out.append(entry["package"])
-                    entry["delivered"] = True
+                pkg = entry.get("package") if isinstance(entry, dict) else None
+                # Skip anything malformed (e.g. a hand-edited database) instead of failing the whole inbox.
+                if not isinstance(pkg, dict) or pkg.get("recipient") != conn.user or entry.get("delivered"):
+                    continue
+                out.append(pkg)
+                entry["delivered"] = True
             if out:
                 self.db.save()
         return {"ok": True, "messages": out}
@@ -212,27 +282,89 @@ class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address, app: ChatApp):
+    def __init__(self, address, app: ChatApp, tls_context: ssl.SSLContext):
         self.app = app
+        self.tls_context = tls_context
+        self._connections = set()
+        self._conn_lock = threading.Lock()
         super().__init__(address, RequestHandler)
 
+    def get_request(self):
+        """Every accepted connection is wrapped in TLS before anything is read from it.
+        The handshake itself runs later, in the connection's thread (see RequestHandler.setup)."""
+        sock, addr = self.socket.accept()
+        return self.tls_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
 
-def start_in_background(host: str, port: int, db_path: str) -> ThreadedServer:
-    """Start a server on a background thread (used by tests and the demo). Port 0 = pick a free port."""
-    srv = ThreadedServer((host, port), ChatApp(db_path))
+    def handle_error(self, request, client_address):
+        """A connection that fails (e.g. a failed TLS handshake) is closed quietly
+        instead of printing a traceback; the server carries on."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, OSError)):
+            log.info("dropped connection from %s:%s (%s)", *client_address, exc.__class__.__name__)
+        else:
+            log.exception("error on connection from %s:%s", *client_address)
+
+    def track(self, sock):
+        with self._conn_lock:
+            self._connections.add(sock)
+
+    def untrack(self, sock):
+        with self._conn_lock:
+            self._connections.discard(sock)
+
+    def stop(self):
+        """Stop accepting, then drop every open session (like the process exiting)."""
+        self.shutdown()
+        with self._conn_lock:
+            for sock in list(self._connections):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        self.server_close()
+
+
+def start_in_background(host: str, port: int, db_path: str, tls_dir: str | None = None) -> ThreadedServer:
+    """Start a server on a background thread (used by tests and the demo). Port 0 = pick a free port.
+    TLS certificates live in `tls_dir` (default: a "tls" folder next to the database);
+    clients must trust `server.ca_file`."""
+    tls_dir = tls_dir or os.path.join(os.path.dirname(os.path.abspath(db_path)), "tls")
+    paths, _ = ensure_server_tls(tls_dir)
+    srv = ThreadedServer((host, port), ChatApp(db_path), server_context(paths["cert"], paths["key"]))
+    srv.ca_file = paths["ca"]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
 
 def main():
     parser = argparse.ArgumentParser(description="Secure chat relay server")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="127.0.0.1", help="address to listen on (0.0.0.0 = all networks)")
     parser.add_argument("--port", type=int, default=5050)
     parser.add_argument("--db", default="server_data/db.json", help="path of the JSON database")
+    parser.add_argument("--tls-dir", default="server_data/tls", help="folder for the TLS certificates")
+    parser.add_argument("--hostname", action="append", default=[],
+                        help="extra name or IP clients will use to reach this server (repeatable; "
+                             "only used when the certificates are first created)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [server] %(message)s")
-    with ThreadedServer((args.host, args.port), ChatApp(args.db)) as srv:
-        log.info("listening on %s:%d, database %s", args.host, args.port, args.db)
+
+    names = list(DEFAULT_HOSTNAMES) + args.hostname + ([args.host] if args.host not in ("0.0.0.0", "::") else [])
+    paths, created = ensure_server_tls(args.tls_dir, names)
+    if created:
+        log.info("created TLS certificates in %s for: %s", args.tls_dir, ", ".join(dict.fromkeys(names)))
+    log.info("clients must trust %s (fingerprint %s)", paths["ca"], certificate_fingerprint(paths["ca"]))
+    try:
+        srv = ThreadedServer((args.host, args.port), ChatApp(args.db), server_context(paths["cert"], paths["key"]))
+    except ssl.SSLError as exc:
+        sys.exit(f"Cannot load the TLS certificate or key in {args.tls_dir} ({exc}). "
+                 "Delete that folder to create new ones.")
+    except OSError as exc:
+        sys.exit(f"Cannot listen on {args.host}:{args.port} ({exc}). "
+                 "Is another server already running? Try --port with another number.")
+    except ValueError as exc:
+        sys.exit(f"Cannot read the database {args.db}: {exc}")
+    with srv:
+        log.info("listening on %s:%d with TLS 1.3, database %s", args.host, args.port, args.db)
         try:
             srv.serve_forever()
         except KeyboardInterrupt:

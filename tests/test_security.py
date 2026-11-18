@@ -39,6 +39,16 @@ class PasswordHashingTests(unittest.TestCase):
         self.assertTrue(verify_password("correct password", rec))
         self.assertFalse(verify_password("wrong password", rec))
 
+    def test_client_login_hash(self):
+        from crypto_utils.passwords import client_password_hash, is_login_hash
+        h = client_password_hash("alice", "same password")
+        self.assertEqual(h, client_password_hash("alice", "same password"))  # same on every device
+        self.assertNotEqual(h, client_password_hash("bob", "same password"))  # username acts as salt
+        self.assertNotEqual(h, client_password_hash("alice", "same passwore"))
+        self.assertTrue(is_login_hash(h))
+        self.assertNotIn("same password", h)
+        self.assertFalse(is_login_hash("same password"))
+
     def test_record_contains_no_plaintext(self):
         rec = hash_password("SuperSecret!")
         self.assertNotIn("SuperSecret!", json.dumps(rec))
@@ -129,13 +139,12 @@ class EndToEndTests(unittest.TestCase):
     def tearDownClass(cls):
         for c in cls.clients.values():
             c.close()
-        cls.srv.shutdown()
-        cls.srv.server_close()
+        cls.srv.stop()
         shutil.rmtree(cls.workdir, ignore_errors=True)
 
     @classmethod
     def client(cls, name):
-        return ChatClient(cls.host, cls.port, os.path.join(cls.workdir, f"device-{name}"))
+        return ChatClient(cls.host, cls.port, os.path.join(cls.workdir, f"device-{name}"), ca_file=cls.srv.ca_file)
 
     def setUp(self):
         self.alice.inbox()  # start each test with an empty inbox
@@ -258,8 +267,59 @@ class EndToEndTests(unittest.TestCase):
             try:
                 with self.assertRaises(ClientError):
                     c.login("alice", attempt)
+                # Skip the client and send the stolen hash straight to the server
+                # as if it were the login hash. It has the right shape (32 bytes,
+                # base64) but the server hashes it again, so it still fails.
+                resp = c.conn.request({"action": "login", "username": "alice", "password_hash": rec["hash"]})
+                self.assertFalse(resp["ok"])
             finally:
                 c.close()
+
+    # ---- password handling on the wire and in logs
+    def test_8_server_never_receives_the_password(self):
+        """Record every request the server gets during signup and logins: the
+        real password must not appear in any of them."""
+        seen = []
+        real_dispatch = self.srv.app.dispatch
+
+        def recording_dispatch(conn, req):
+            seen.append(json.dumps(req))
+            return real_dispatch(conn, req)
+
+        password = "my-very-secret-pw-8"
+        self.srv.app.dispatch = recording_dispatch
+        try:
+            c = self.client("carol")
+            c.signup("carol", password)
+            c.logout()
+            c.login("carol", password)
+            with self.assertRaises(ClientError):
+                c.login("carol", password + "-typo")
+            c.close()
+        finally:
+            self.srv.app.dispatch = real_dispatch
+        traffic = "\n".join(seen)
+        self.assertTrue(seen)
+        self.assertNotIn(password, traffic)
+        self.assertNotIn("-typo", traffic)
+        self.assertIn("password_hash", traffic)
+
+    def test_9_failed_logins_are_not_logged(self):
+        """Someone types their password into the username box. The server must
+        not write it to its log."""
+        with self.assertLogs("server", level="INFO") as logs:
+            c = self.client("alice")  # Alice's device folder, so her key file is there
+            try:
+                c.login("alice", PW["alice"])  # a success, so the log is not empty
+                for typed_name in ("hunter2secret", "alice"):  # unknown name, then wrong password
+                    with self.assertRaises(ClientError):
+                        c.login(typed_name, "whatever-password")
+            finally:
+                c.close()
+        output = "\n".join(logs.output)
+        self.assertIn("login: alice", output)
+        self.assertNotIn("hunter2secret", output)
+        self.assertNotIn("failed", output)
 
     def test_7b_stolen_messages_cannot_be_read(self):
         self.bob.send("alice", "confidential")
