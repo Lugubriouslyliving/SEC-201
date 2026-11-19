@@ -15,7 +15,7 @@ protocol summary). These documents go much deeper.
 | 2 | [crypto_utils, line by line](02-crypto-utils.md) | Base64 and canonical JSON, password hashing, key pairs and the key file, the message format, TLS certificates |
 | 3 | [The server, line by line](03-server.md) | The JSON database and the TLS relay server |
 | 4 | [The client, line by line](04-client.md) | The TLS connection, the client logic (keys, pinning, replay list), the interactive shell and chat mode |
-| 5 | [Demo and tests](05-demo-and-tests.md) | `demo.py` and the eavesdropping proxy line by line, plus what each of the 70 automated tests proves |
+| 5 | [Demo and tests](05-demo-and-tests.md) | `demo.py` and the eavesdropping proxy line by line, plus what each of the 79 automated tests proves |
 | 6 | [Security, integrity and privacy analysis](06-security-analysis.md) | Does the system provide them, how, against whom, and every known way it can be attacked or fail |
 
 If you only have ten minutes, read document 1 and then document 6.

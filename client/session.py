@@ -10,6 +10,7 @@ Local files, per user, under the client's data folder (default ./client_data):
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -124,7 +125,9 @@ class ChatClient:
 
     # ------------------------------------------------------------ accounts
 
-    def signup(self, username: str, password: str) -> None:
+    def signup(self, username: str, password: str, consent_version: str | None = None) -> None:
+        """`consent_version` is the privacy-notice version the person accepted. The shell
+        shows the notice and asks; tests and the demo accept it by passing nothing."""
         if not isinstance(username, str) or not USERNAME_RE.fullmatch(username):
             raise ClientError("Username must be 3-20 characters using only a-z, 0-9 and _ (lowercase).")
         if not MIN_PASSWORD_LEN <= len(password) <= MAX_PASSWORD_LEN:
@@ -140,6 +143,7 @@ class ChatClient:
             "password_hash": login_hash,
             "enc_public_pem": keys.enc_public_pem(),
             "sign_public_pem": keys.sign_public_pem(),
+            "consent_version": consent_version or self.privacy_notice()["version"],
         })
         # Only after the server accepted the name do we write the key file.
         self._write_json(username, "keys.json", keys.to_encrypted_file(password))
@@ -305,3 +309,23 @@ class ChatClient:
 
     def inbox(self) -> list[dict]:
         return [self.open_package(p) for p in self.fetch_inbox()]
+
+    # ------------------------------------------------------------ privacy rights
+
+    def privacy_notice(self) -> dict:
+        """The server's privacy notice: {"version": ..., "text": ...}. No login needed."""
+        return self._request({"action": "privacy_notice"})
+
+    def mydata(self) -> dict:
+        """Everything the server stores about me (PDPA s.30 access, s.31 portability)."""
+        self._require_login()
+        return self._request({"action": "mydata"})["data"]
+
+    def delete_account(self, password: str) -> None:
+        """Erase my account on the server and my files on this device (PDPA s.33)."""
+        self._require_login()
+        self._request({"action": "delete_account",
+                       "password_hash": self._hash_password(self.username, password)})
+        # The server has erased the account; now remove keys, pins and seen IDs here too.
+        shutil.rmtree(os.path.join(self.data_dir, self.username), ignore_errors=True)
+        self.username, self.keys, self.seen_ids = None, None, set()

@@ -58,14 +58,27 @@ for completeness and not considered further.
 | Stored credentials useless if stolen | Server stores `scrypt(login hash, 16-byte random salt)` ([passwords.py:47–62](../crypto_utils/passwords.py#L47-L62)); sending the stored hash is just another wrong guess | A4 | **[tested]** `test_7a_stolen_hash_cannot_log_in` |
 | Slow guessing | scrypt N=2^15, r=8: ≈32 MiB and ≈0.1 s per guess | A4, A5 | Parameters in [passwords.py:35–39](../crypto_utils/passwords.py#L35-L39) |
 | No timing leak in comparison | `hmac.compare_digest` ([passwords.py:73](../crypto_utils/passwords.py#L73)) | A1, A2 | Code |
-| Login doesn't reveal whether a user exists | Same message; dummy scrypt for unknown users ([server.py:192–199](../server/server.py#L192-L199)) | A2 | **[tested]** `test_6_login_failures_look_identical`; demo scenario 6 (113 ms vs 116 ms). *But see V4: signup does reveal it.* |
-| Passwords typed in the wrong box aren't logged | Failed logins are not logged; impossible names never leave the client ([server.py:195–199](../server/server.py#L195-L199), [session.py:159–160](../client/session.py#L159-L160)) | A3 (logs) | **[tested]** `test_9_failed_logins_are_not_logged` |
+| Login doesn't reveal whether a user exists | Same message; dummy scrypt for unknown users ([server.py:205–212](../server/server.py#L205-L212)) | A2 | **[tested]** `test_6_login_failures_look_identical`; demo scenario 6 (113 ms vs 116 ms). *But see V4: signup does reveal it.* |
+| Passwords typed in the wrong box aren't logged | Failed logins are not logged; impossible names never leave the client ([server.py:208–212](../server/server.py#L208-L212), [session.py:163–164](../client/session.py#L163-L164)) | A3 (logs) | **[tested]** `test_9_failed_logins_are_not_logged` |
 | Private keys protected at rest | AES-256-GCM under `scrypt(password, random salt)` ([keys.py:60–92](../crypto_utils/keys.py#L60-L92)) | A5 | **[tested]** `test_wrong_password_cannot_unlock`, `test_file_has_no_plaintext_private_key` |
 | Private keys never on the server | Generated and stored only on the client | A3, A4 | **[tested]** `test_2_…`, `test_7b_…` |
 | Real server, encrypted channel | TLS 1.3 only; client trusts only the private CA and checks the host name ([tls.py:132–146](../crypto_utils/tls.py#L132-L146), [connection.py:35–48](../client/connection.py#L35-L48)) | A1 | **[tested]** all of `test_tls.py` |
 | Nobody can mint new trusted certificates | CA private key discarded after one use ([tls.py:100](../crypto_utils/tls.py#L100)) | A3, A4 | **[tested]** `test_ca_private_key_is_not_kept` |
-| Access control | `users`/`send`/`inbox` need a logged-in connection; `send` only as yourself ([server.py:135–136](../server/server.py#L135-L136), [server.py:239–241](../server/server.py#L239-L241)) | A2 | **[tested]** `test_6b_…`, `test_4a_…` |
+| Access control | `users`/`send`/`inbox` need a logged-in connection; `send` only as yourself ([server.py:144–145](../server/server.py#L144-L145), [server.py:252–254](../server/server.py#L252-L254)) | A2 | **[tested]** `test_6b_…`, `test_4a_…` |
 | Robust input handling | Strict parsing and size limits on both sides; one bad request never affects others | A2, A1 | **[tested]** 36 tests in `test_edge_cases.py` |
+
+## 6.3b Privacy mechanisms added for data protection law
+
+These protect people's personal data in ways encryption alone does not: they limit what is
+kept, for how long, and who can tie it to a person.
+
+| Mechanism | How | Against | Evidence |
+|---|---|---|---|
+| **Pseudonymous logs (conditional privacy)** | Usernames and IP addresses in the log are replaced by `HMAC-SHA256(secret key, value)` pseudonyms; only the key holder can re-identify them with `py -m server.reidentify` ([privacy.py:55–83](../server/privacy.py#L55-L83), [reidentify.py:19–38](../server/reidentify.py#L19-L38)) | A3 reading the log, anyone who gets a copy of the log | **[tested]** `test_server_log_has_no_usernames_or_ip_addresses`, `test_reidentification_needs_the_key`, `test_reidentify_command` |
+| **Retention and deletion** | Delivered packages are deleted at once; undelivered ones after 30 days; only random message IDs are kept for replay checks ([privacy.py:86–100](../server/privacy.py#L86-L100)) | A4 (a stolen database holds no history) | **[tested]** `test_delivered_messages_are_deleted_from_the_server`, `test_undelivered_messages_expire_after_retention_period` |
+| **Notice and recorded consent** | The notice is shown before signup and must be accepted; the server stores the accepted version and time ([server.py:176–178](../server/server.py#L176-L178), [server.py:190](../server/server.py#L190)) | Collecting data without informing people | **[tested]** `test_privacy_notice_is_available_before_login`, `test_signup_requires_accepting_the_current_notice` |
+| **Right of access and portability** | `mydata` returns everything stored about the caller as JSON, without the password record ([server.py:301–319](../server/server.py#L301-L319)) | People not knowing what is held about them | **[tested]** `test_mydata_shows_my_data_but_not_the_password_hash` |
+| **Right to erasure** | `delete_account` re-checks the password, then erases the account, every message to or from it, and the device's local files ([server.py:321–339](../server/server.py#L321-L339), [session.py:324–331](../client/session.py#L324-L331)) | Data kept after a person leaves | **[tested]** `test_delete_account_erases_everything` |
 
 ## 6.4 Integrity: how it is achieved
 
@@ -73,12 +86,12 @@ for completeness and not considered further.
 |---|---|---|
 | **The message was not changed** | Ed25519 signature over the canonical JSON of all 8 fields; any change fails ([messages.py:67–77](../crypto_utils/messages.py#L67-L77), [messages.py:170–178](../crypto_utils/messages.py#L170-L178)) | **[tested]** `test_every_signed_field_is_protected`, `test_3_…` |
 | **…checked twice** | AES-GCM's 128-bit tag also covers the ciphertext and the metadata (as associated data) ([messages.py:80–89](../crypto_utils/messages.py#L80-L89)) | Demo scenario 3 (`InvalidTag`) |
-| **It came from the claimed sender** | Signature checked with the sender's **pinned** key, before decrypting ([session.py:290](../client/session.py#L290)) | **[tested]** `test_4b_…` |
+| **It came from the claimed sender** | Signature checked with the sender's **pinned** key, before decrypting ([session.py:294](../client/session.py#L294)) | **[tested]** `test_4b_…` |
 | **It was meant for me** | The signed `recipient` must be me ([messages.py:182–183](../crypto_utils/messages.py#L182-L183)). Alice cannot pass Bob's message on to Carol as if Bob had sent it to Carol | **[tested]** `test_message_for_someone_else_rejected` |
-| **It is not a repeat** | The server accepts each message ID once; the client remembers accepted IDs on disk ([server.py:253–257](../server/server.py#L253-L257), [messages.py:186–190](../crypto_utils/messages.py#L186-L190)) | **[tested]** `test_5a_…`, `test_5b_…`, `test_5c_…` |
+| **It is not a repeat** | The server accepts each message ID once; the client remembers accepted IDs on disk ([server.py:266–270](../server/server.py#L266-L270), [messages.py:186–190](../crypto_utils/messages.py#L186-L190)) | **[tested]** `test_5a_…`, `test_5b_…`, `test_5c_…` |
 | **Signatures can't be reused for something else** | Context label `secure-chat/message/v1` inside every signature | Code |
-| **Junk signed by a real user can't break the client** | Strict shape checks; every failure is a clean rejection ([messages.py:233–261](../crypto_utils/messages.py#L233-L261), [session.py:296–301](../client/session.py#L296-L301)) | **[tested]** `test_validly_signed_garbage_is_rejected_cleanly` |
-| **Text can't fake chat lines** | `safe_display` escapes control and formatting characters ([session.py:49–66](../client/session.py#L49-L66)) | **[tested]** `test_message_cannot_fake_extra_chat_lines`; message IDs and usernames are restricted so they can't carry control characters either: `test_message_ids_must_be_hex_so_logs_cannot_be_forged`, `test_username_with_trailing_newline_is_refused` |
+| **Junk signed by a real user can't break the client** | Strict shape checks; every failure is a clean rejection ([messages.py:233–261](../crypto_utils/messages.py#L233-L261), [session.py:300–305](../client/session.py#L300-L305)) | **[tested]** `test_validly_signed_garbage_is_rejected_cleanly` |
+| **Text can't fake chat lines** | `safe_display` escapes control and formatting characters ([session.py:50–67](../client/session.py#L50-L67)) | **[tested]** `test_message_cannot_fake_extra_chat_lines`; message IDs and usernames are restricted so they can't carry control characters either: `test_message_ids_must_be_hex_so_logs_cannot_be_forged`, `test_username_with_trailing_newline_is_refused` |
 | **Network traffic is not changed** | TLS 1.3 authenticated encryption | **[tested]** `test_tls.py` |
 
 **What integrity does *not* cover:** whether you received *every* message, in the right
@@ -93,9 +106,9 @@ else was not dropped (see V3).
 | Password | hidden | **hidden** | hidden |
 | Login hash | hidden (TLS) | **visible** (it checks it) | not stored (only `scrypt` of it) |
 | Usernames, directory, public keys | hidden (TLS) | visible | visible |
-| Who sent what to whom, and when | hidden (TLS) | **visible** | visible (messages are never deleted) |
+| Who sent what to whom, and when | hidden (TLS) | **visible** while a message waits | only for messages still waiting (delivered ones are deleted) |
 | Message length | approximately (traffic volume) | visible (to the byte, +16) | visible |
-| That you use the service, when and how much | **visible** (IP addresses, timing, volume) | visible (IP addresses in the log) | not stored |
+| That you use the service, when and how much | **visible** (IP addresses, timing, volume) | sees your IP while connected; the log keeps only a keyed pseudonym | not stored |
 
 Why the server cannot read messages, in one sentence: each message's AES key exists only
 inside `wrapped_key`, which only the recipient's RSA private key can open, and that key was
@@ -107,20 +120,20 @@ generated on the recipient's computer and never sent anywhere.
 |---|---|---|---|---|
 | **V1** | Message ID (and a username ending in a newline) printed unescaped in the server log and in client verbose mode | Low–Medium | A2 (any user) | **Fixed** (was **[verified]**); regression tests added |
 | **V2** | Public keys are trusted on first use (TOFU) | **Medium–High** | A3, or A1 with `server.key` | Design limit; fingerprints mitigate |
-| **V3** | The server sees all metadata and controls delivery | **Medium** | A3 | Design limit |
+| **V3** | The server sees metadata and controls delivery | **Medium** | A3 | Design limit; stored history and logs reduced (retention, pseudonyms) |
 | **V4** | Signup and the directory reveal which usernames exist | Medium | A2, anyone who can sign up | **[verified]**, not fixed |
 | **V5** | No rate limiting on login or signup | Medium | A1/A2 (anyone who can connect) | Not fixed |
 | **V6** | Resource exhaustion (connections, storage, database growth) | Medium | A2 | Partly mitigated |
 | **V7** | The login hash is a password-equivalent for the server | Medium | A3 | Design limit |
 | **V8** | Offline guessing of weak passwords | Medium | A4 (if V7), A5 | Mitigated by scrypt only |
 | **V9** | `server.key` stored unencrypted | Medium | Whoever reads the server's disk | Accepted risk |
-| **V10** | No forward secrecy for stored messages; messages are never deleted | Low–Medium | A3/A4 plus a later key theft | Design limit |
+| **V10** | No forward secrecy for messages | Low–Medium | A3/A4 plus a later key theft | Partly reduced (delivered messages deleted) |
 | **V11** | Messages are marked delivered before the client confirms | Low | Accident, or A1 cutting the connection | Not fixed |
 | **V12** | Local `seen_ids.json` and `known_keys.json` are not protected | Low | A5/A6 | Accepted risk |
 | **V13** | No deniability: signatures prove authorship to anyone | Low (privacy) | The recipient | Design choice |
 | **V14** | Message length and traffic timing leak | Low | A1, A3 | Design limit |
 | **V15** | Plaintext and keys linger in memory and the terminal | Low | A6, anyone at the screen | Accepted risk |
-| **V16** | No key rotation, revocation, password change or account deletion | Low | — | Missing feature |
+| **V16** | No key rotation, revocation or password change | Low | — | Missing feature (account deletion now exists) |
 | **V17** | Look-alike usernames (`a1ice` vs `alice`) | Low | A2 | Fingerprints mitigate |
 | **V18** | `ca.crt` must reach clients safely | Low | A1 during the copy | Fingerprint mitigates |
 
@@ -128,9 +141,9 @@ generated on the recipient's computer and never sent anywhere.
 
 **What it was:** The sender chooses `msg_id`. The server and the client only checked
 that it was a string of 1–64 characters. The server then printed it as-is in its log
-([server.py:254](../server/server.py#L254), [server.py:261–262](../server/server.py#L261-L262)),
+([server.py:267](../server/server.py#L267), [server.py:275–276](../server/server.py#L275-L276)),
 and the client printed it raw in verbose traces
-([session.py:291](../client/session.py#L291)).
+([session.py:295](../client/session.py#L295)).
 
 **Attack (reproduced during this review, before the fix):** Eve sent a package whose ID
 was `"x\n2026-01-01 [server] login: admin\x1b[31m"` (41 characters). The server accepted
@@ -148,16 +161,16 @@ normal (non-verbose) chat output was already safe through `safe_display`.
 
 **Fix (now in the code):**
 - The server accepts only IDs of exactly 32 lowercase hex characters, the format
-  `uuid4().hex` produces ([server.py:48](../server/server.py#L48),
-  [server.py:234–235](../server/server.py#L234-L235)).
+  `uuid4().hex` produces ([server.py:49](../server/server.py#L49),
+  [server.py:247–248](../server/server.py#L247-L248)).
 - The client applies the same rule when opening a package
   ([messages.py:252–253](../crypto_utils/messages.py#L252-L253)), so it also holds against
   a malicious server.
 - The client's verbose trace passes the not-yet-validated ID through `safe_display`
-  ([session.py:291](../client/session.py#L291)).
+  ([session.py:295](../client/session.py#L295)).
 - Usernames are checked with `fullmatch` on both sides
-  ([server.py:153](../server/server.py#L153), [session.py:128](../client/session.py#L128),
-  [session.py:159](../client/session.py#L159)).
+  ([server.py:162](../server/server.py#L162), [session.py:131](../client/session.py#L131),
+  [session.py:163](../client/session.py#L163)).
 
 **Evidence:** **[tested]** `test_message_ids_must_be_hex_so_logs_cannot_be_forged` replays
 the exact attack ID (and five other malformed IDs) and checks the server refuses it,
@@ -170,7 +183,7 @@ refused the package, and the log stayed clean.
 
 **What:** When Bob first looks up Alice, he must trust whatever public keys the server
 returns; the client pins them from then on
-([session.py:220–228](../client/session.py#L220-L228)).
+([session.py:224–232](../client/session.py#L224-L232)).
 
 **Attack:** A malicious server (A3), or someone holding `server.key` (see V9), gives Bob
 **its own** keys labelled "alice" the first time, and does the same to Alice for "bob".
@@ -179,7 +192,7 @@ re-sign it with its own key. Both clients accept everything, because the substit
 are the pinned ones. This is a full man-in-the-middle of the end-to-end layer.
 
 **What stops it:** Only comparing fingerprints out of band. `users` and `chat` show them
-([cli.py:106–107](../client/cli.py#L106-L107), [cli.py:147](../client/cli.py#L147)).
+([cli.py:114–115](../client/cli.py#L114-L115), [cli.py:155](../client/cli.py#L155)).
 If Bob and Alice compare and they match, no substitution happened. Once pinned, a later
 swap **is** detected: **[tested]**
 `test_database_wiped_and_name_reregistered_by_someone_else`.
@@ -189,8 +202,16 @@ substitution detectable or publicly auditable.
 
 ### V3. The server sees metadata and controls delivery
 
-**What:** The server must know sender and recipient to route messages, and stores
-packages forever ([server.py:259](../server/server.py#L259); nothing ever deletes them).
+**What:** The server must know sender and recipient to route messages
+([server.py:273](../server/server.py#L273)).
+
+**Partly reduced since the first version:** the server now deletes each package as soon as
+it is delivered, and undelivered ones after 30 days
+([server.py:291](../server/server.py#L291), [privacy.py:86–100](../server/privacy.py#L86-L100)),
+and its log shows only keyed pseudonyms instead of usernames and IP addresses
+([privacy.py:55–83](../server/privacy.py#L55-L83)). So a stolen database or log no longer
+holds a history of who talked to whom. A server that is malicious *while running* still
+sees each message's sender and recipient as it passes through.
 
 **Attacks:** A malicious server can:
 - build a complete social graph: who talks to whom, when, how often, how much;
@@ -209,8 +230,8 @@ clients detect gaps.
 ### V4. Username enumeration **[verified]**
 
 **What:** Login carefully gives one message for "no such user" and "wrong password". But
-signup answers `That username is taken.` ([server.py:171–172](../server/server.py#L171-L172)),
-and any logged-in user can list every username ([server.py:210–219](../server/server.py#L210-L219)).
+signup answers `That username is taken.` ([server.py:183–184](../server/server.py#L183-L184)),
+and any logged-in user can list every username ([server.py:223–232](../server/server.py#L223-L232)).
 
 **Attack:** Anyone can sign up once and call `users`, or try signing up as `alice` and
 read the reply. During this review, trying to sign up as an existing name returned
@@ -227,10 +248,10 @@ knowing a name isn't enough.
 **What:** Nothing limits how many logins or signups one client may attempt.
 
 **Attack:** Online password guessing. Each server-side check costs about 0.1 s in one of
-4 scrypt slots ([server.py:56](../server/server.py#L56)), so the server checks roughly
+4 scrypt slots ([server.py:57](../server/server.py#L57)), so the server checks roughly
 **40 guesses per second**, about 3.5 million per day, against a known username (V4). The
 minimum password length is 8 with no strength check
-([session.py:27](../client/session.py#L27)), so weak passwords such as `password1`
+([session.py:28](../client/session.py#L28)), so weak passwords such as `password1`
 would fall quickly. Signup can also be scripted to create unlimited accounts.
 
 **Fix:** Per-account and per-IP limits with growing delays, account lockout with alerts,
@@ -243,10 +264,11 @@ scrypt (4 at once), and strict parsing.
 
 **What is not:**
 - **Unlimited connections:** each one gets a thread, and after login there is no idle
-  timeout ([server.py:71](../server/server.py#L71)). Thousands of open connections exhaust
+  timeout ([server.py:72](../server/server.py#L72)). Thousands of open connections exhaust
   threads or memory.
-- **Unlimited storage:** any user can send up to ~1 MB packages without limit, and
-  delivered messages are never deleted, so the disk fills up.
+- **Unlimited storage:** any user can send up to ~1 MB packages without limit. Delivered
+  messages are now deleted, but a user can still fill the disk with messages nobody
+  collects, for up to the 30-day retention period.
 - **Database rewrite:** every `send` rewrites the whole `db.json`
   ([storage.py:40–48](../server/storage.py#L40-L48)) under one lock. Cost grows with the
   database size, so a large database slows everyone down.
@@ -255,13 +277,14 @@ scrypt (4 at once), and strict parsing.
 - **Login queue:** if many scrypt checks queue up behind the 4 slots, a client waiting more
   than 30 s gives up ([connection.py:21](../client/connection.py#L21)).
 
-**Fix:** Connection and idle limits, per-user quotas, deleting delivered messages, a real
-database (such as SQLite), and paginated inboxes.
+**Fix:** Connection and idle limits, per-user quotas, a real database (such as SQLite),
+paginated inboxes, and expiring old entries from `seen_msg_ids` together with a
+timestamp window.
 
 ### V7. The login hash is a password-equivalent for the server
 
 **What:** The server receives `h = scrypt(password, salt from username)` on every login
-and compares it ([server.py:185–194](../server/server.py#L185-L194)).
+and compares it ([server.py:198–207](../server/server.py#L198-L207)).
 
 **Attack:** A malicious operator can log `h` and later replay it to log in as you. That
 gives them your inbox (and lets them mark your messages delivered so you never see them),
@@ -302,21 +325,25 @@ already pinned each other's real keys.
 **Fix:** Restrictive file permissions, a passphrase or hardware key store, and
 re-creating `server_data/tls` (and redistributing `ca.crt`) if it may have been copied.
 
-### V10. No forward secrecy for stored messages; nothing is deleted
+### V10. No forward secrecy for messages
 
 **What:** TLS 1.3 gives the *connection* forward secrecy, but each message's AES key is
-wrapped with a long-term RSA key. The server keeps every package forever.
+wrapped with a long-term RSA key.
 
 **Attack:** Someone who copies the database today and steals Alice's `keys.json` **and**
-password next year can decrypt every message ever sent to her.
+password next year can decrypt the messages that were waiting for her in that copy.
 
-**Fix:** Delete messages after delivery, and use ephemeral key agreement per message or
-session (X25519, the Double Ratchet) so old keys are destroyed.
+**Partly reduced:** delivered messages are now deleted from the server at once, so a copy
+of the database only holds messages that had not been read yet (at most 30 days' worth).
+Before this change, a copy held every message ever sent.
+
+**Fix:** Ephemeral key agreement per message or session (X25519, the Double Ratchet), so
+old keys are destroyed and old ciphertext can never be opened.
 
 ### V11. Delivery before confirmation
 
 **What:** `inbox` marks messages delivered as soon as it sends them
-([server.py:275](../server/server.py#L275)), before the client has verified or saved them.
+([server.py:289](../server/server.py#L289)), before the client has verified or saved them.
 
 **Attack or accident:** If the connection drops or the client crashes right after the
 server replies, those messages are never shown and never re-sent. An attacker who can cut
@@ -367,11 +394,12 @@ at an unlocked screen.
 **Fix:** Mostly outside the app's control. Clear the terminal (`cls`), lock the screen,
 and leave verbose mode off on shared computers.
 
-### V16. No key rotation, revocation, password change or account deletion
+### V16. No key rotation, revocation or password change
 
 If a private key or password is compromised, there is no way to replace the keys under the
-same name, warn contacts, change the password, or delete the account. The name stays bound
-to the old keys forever.
+same name, warn contacts, or change the password. The only remedy is `delete_account`
+followed by a new sign-up, after which contacts' clients will see the new keys as
+`CHANGED - not trusted` until they compare fingerprints again.
 
 ### V17. Look-alike usernames
 

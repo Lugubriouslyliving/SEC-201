@@ -2,9 +2,9 @@
 
 [← The client](04-client.md) · [Index](README.md) · Next: [Security analysis →](06-security-analysis.md)
 
-- [5.1 `demo.py`, line by line](#51-demopy-line-by-line): the eight-scenario presentation
+- [5.1 `demo.py`, line by line](#51-demopy-line-by-line): the nine-scenario presentation
 - [5.2 `tests/mitm.py`, line by line](#52-testsmitmpy-line-by-line): the eavesdropping proxy
-- [5.3 What each automated test proves](#53-what-each-automated-test-proves): all 70 tests
+- [5.3 What each automated test proves](#53-what-each-automated-test-proves): all 79 tests
 
 Run them with:
 
@@ -28,7 +28,7 @@ temporary folder that is deleted at the end.
 ```python
  1  """Guided demonstration: every protection, step by step, in the terminal.
  2  
- 3  Run:  py demo.py            (all eight scenarios)
+ 3  Run:  py demo.py            (all nine scenarios)
  4        py demo.py --pause    (wait for Enter between scenarios, good for presenting)
  5  
  6  The demo starts its own server on a free port with a throwaway database in
@@ -216,332 +216,380 @@ temporary folder that is deleted at the end.
 
 ### Scenario 2: what the server stores
 
-[`demo.py` lines 108–126](../demo.py#L108-L126)
+[`demo.py` lines 108–131](../demo.py#L108-L131)
 
 ```python
 108          # ------------------------------------------------------------ 2
 109          banner("2. SERVER VIEW: what the server actually stores")
-110          with open(db_path, encoding="utf-8") as f:
-111              db = json.load(f)
-112          print("  users table (alice):")
-113          rec = db["users"]["alice"]
-114          print(f"    password: {json.dumps(rec['password'])}")
-115          print(f"    enc_public_pem:  {rec['enc_public_pem'].splitlines()[1][:50]}...  (public, not secret)")
-116          print(f"    sign_public_pem: {rec['sign_public_pem'].splitlines()[1][:50]}...  (public, not secret)")
-117          print("  messages table (first message):")
-118          pkg = db["messages"][0]["package"]
-119          for k, v in pkg.items():
-120              text = str(v)
-121              print(f"    {k:<12} {text[:60]}{'...' if len(text) > 60 else ''}")
-122          raw = json.dumps(db)
-123          print(f"\n  Does the word 'meeting' appear anywhere in the database?  {'meeting' in raw}")
-124          print("  Does any password appear in it?  "
-125                f"{any(p in raw for p in PASSWORDS.values())}")
-126          print("  Server keeps: salted hashes, public keys, ciphertext, and metadata (who, to whom, when).")
+110          bob.send("alice", "Lunch at noon? The meeting room is booked.")  # waiting, so it is still stored
+111          with open(db_path, encoding="utf-8") as f:
+112              db = json.load(f)
+113          print("  users table (alice):")
+114          rec = db["users"]["alice"]
+115          print(f"    password: {json.dumps(rec['password'])}")
+116          print(f"    enc_public_pem:  {rec['enc_public_pem'].splitlines()[1][:50]}...  (public, not secret)")
+117          print(f"    sign_public_pem: {rec['sign_public_pem'].splitlines()[1][:50]}...  (public, not secret)")
+118          print("  messages table (first message):")
+119          pkg = db["messages"][0]["package"]
+120          for k, v in pkg.items():
+121              text = str(v)
+122              print(f"    {k:<12} {text[:60]}{'...' if len(text) > 60 else ''}")
+123          raw = json.dumps(db)
+124          print(f"\n  Does the word 'meeting' appear anywhere in the database?  {'meeting' in raw}")
+125          print(f"  Does the word 'Lunch' appear anywhere in the database?  {'Lunch' in raw}")
+126          print("  Does any password appear in it?  "
+127                f"{any(p in raw for p in PASSWORDS.values())}")
+128          print("  Server keeps: salted hashes, public keys, ciphertext, and metadata (who, to whom, when).")
+129          alice.inbox()  # Alice reads it; the server deletes delivered messages at once (retention)
+130          with open(db_path, encoding="utf-8") as f:
+131              print(f"  After Alice reads it, messages stored on the server: {len(json.load(f)['messages'])}")
 ```
 
 - **108–109** — Title.
-- **110–111** — Read the server's database file directly, as the operator could.
-- **112–116** — Print Alice's user record: the password record (algorithm, costs, salt, hash) and the start of each public key.
-- **117–121** — Print each field of the first stored message, cut to 60 characters.
-- **122** — The whole database as one string.
-- **123** — Does the word "meeting" from Bob's message appear anywhere? (It doesn't.)
-- **124–125** — Does any of the three passwords appear? (None does.)
-- **126** — Summary of what the server does see.
+- **110** — Bob sends a fresh message that Alice has not read yet. Delivered messages are deleted from the server (retention), so this one is what we can look at.
+- **111–112** — Read the server's database file directly, as the operator could.
+- **113–117** — Print Alice's user record: the password record (algorithm, costs, salt, hash) and the start of each public key.
+- **118–122** — Print each field of the first stored message, cut to 60 characters.
+- **123** — The whole database as one string.
+- **124–125** — Do the words "meeting" or "Lunch" from Bob's waiting message appear anywhere? (They don't: the text is encrypted.)
+- **126–127** — Does any of the three passwords appear? (None does.)
+- **128** — Summary of what the server does see.
+- **129** — Alice reads the message, and the server deletes it at once (retention).
+- **130–131** — Count the messages left on the server: 0.
 
 ### Scenario 3: tampering
 
-[`demo.py` lines 128–148](../demo.py#L128-L148)
+[`demo.py` lines 133–153](../demo.py#L133-L153)
 
 ```python
-128          # ------------------------------------------------------------ 3
-129          banner("3. TAMPERING TEST: flip one byte of the ciphertext in transit")
-130          pkg = bob.build_package("alice", "Pay invoice #1001: 500 baht")
-131          ct = bytearray(b64d(pkg["ciphertext"]))
-132          print(f"   mitm | original ciphertext byte 0: {ct[0]:#04x}")
-133          ct[0] ^= 0x01
-134          print(f"   mitm | modified ciphertext byte 0: {ct[0]:#04x}")
-135          tampered = dict(pkg, ciphertext=base64.b64encode(bytes(ct)).decode())
-136          bob.send_package(tampered)  # the server cannot tell; it cannot read the content
-137          print("   mitm | tampered package delivered to the server (server cannot detect it)")
-138          alice.trace = step_printer("alice")
-139          for r in alice.inbox():
-140              show_result(r)
-141          alice.trace = quiet
-142          print("\n  Second line of defence: even if Alice skipped the signature check,")
-143          print("  AES-GCM's authentication tag would catch the change:")
-144          try:
-145              decrypt_without_signature_check(tampered, alice.keys)
-146              print("  !! decrypted (should not happen)")
-147          except Exception as exc:
-148              print(f"  alice | AES-GCM raised {type(exc).__name__}: tag does not verify -> REJECT")
+133          # ------------------------------------------------------------ 3
+134          banner("3. TAMPERING TEST: flip one byte of the ciphertext in transit")
+135          pkg = bob.build_package("alice", "Pay invoice #1001: 500 baht")
+136          ct = bytearray(b64d(pkg["ciphertext"]))
+137          print(f"   mitm | original ciphertext byte 0: {ct[0]:#04x}")
+138          ct[0] ^= 0x01
+139          print(f"   mitm | modified ciphertext byte 0: {ct[0]:#04x}")
+140          tampered = dict(pkg, ciphertext=base64.b64encode(bytes(ct)).decode())
+141          bob.send_package(tampered)  # the server cannot tell; it cannot read the content
+142          print("   mitm | tampered package delivered to the server (server cannot detect it)")
+143          alice.trace = step_printer("alice")
+144          for r in alice.inbox():
+145              show_result(r)
+146          alice.trace = quiet
+147          print("\n  Second line of defence: even if Alice skipped the signature check,")
+148          print("  AES-GCM's authentication tag would catch the change:")
+149          try:
+150              decrypt_without_signature_check(tampered, alice.keys)
+151              print("  !! decrypted (should not happen)")
+152          except Exception as exc:
+153              print(f"  alice | AES-GCM raised {type(exc).__name__}: tag does not verify -> REJECT")
 ```
 
-- **128–129** — Title.
-- **130** — Bob seals a new message, but it is not sent yet.
-- **131** — Decode the ciphertext into a changeable byte array.
-- **132** — Show its first byte.
-- **133** — Flip the lowest bit of that byte (XOR with 1): the smallest possible change.
-- **134** — Show the changed byte.
-- **135** — A copy of the package with the modified ciphertext. The signature is unchanged (the attacker can't re-sign without Bob's key).
-- **136** — Send it. The server accepts it, because it cannot check contents.
-- **137** — Say so.
-- **138–141** — Alice opens her inbox with tracing on: the signature check fails and the message is rejected.
-- **142–143** — Explain the second check.
-- **144–146** — Try decrypting while deliberately skipping the signature…
-- **147–148** — …AES-GCM raises `InvalidTag`, so the change is caught a second time.
+- **133–134** — Title.
+- **135** — Bob seals a new message, but it is not sent yet.
+- **136** — Decode the ciphertext into a changeable byte array.
+- **137** — Show its first byte.
+- **138** — Flip the lowest bit of that byte (XOR with 1): the smallest possible change.
+- **139** — Show the changed byte.
+- **140** — A copy of the package with the modified ciphertext. The signature is unchanged (the attacker can't re-sign without Bob's key).
+- **141** — Send it. The server accepts it, because it cannot check contents.
+- **142** — Say so.
+- **143–146** — Alice opens her inbox with tracing on: the signature check fails and the message is rejected.
+- **147–148** — Explain the second check.
+- **149–151** — Try decrypting while deliberately skipping the signature…
+- **152–153** — …AES-GCM raises `InvalidTag`, so the change is caught a second time.
 
 ### Scenario 4: Eve pretends to be Bob
 
-[`demo.py` lines 150–166](../demo.py#L150-L166)
+[`demo.py` lines 155–171](../demo.py#L155-L171)
 
 ```python
-150          # ------------------------------------------------------------ 4
-151          banner("4. WRONG-SIGNER TEST: Eve signs a message pretending to be Bob")
-152          alice_pub = next(u for u in eve.users() if u["username"] == "alice")["enc_public_pem"]
-153          forged = encrypt_and_sign("Alice, send me your password. - Bob", "bob", "alice", eve.keys, alice_pub)
-154          print("    eve | built a package with sender='bob' but signed with EVE's private key")
-155          try:
-156              eve.send_package(forged)
-157          except ClientError as exc:
-158              print(f" server | refused: {exc}  (Eve is logged in as eve)")
-159          print("    eve | ...so Eve compromises the server and plants it in Alice's mailbox directly")
-160          with app.db.lock:
-161              app.db.data["messages"].append({"package": forged, "received_at": int(time.time()), "delivered": False})
-162              app.db.save()
-163          alice.trace = step_printer("alice")
-164          for r in alice.inbox():
-165              show_result(r)
-166          alice.trace = quiet
+155          # ------------------------------------------------------------ 4
+156          banner("4. WRONG-SIGNER TEST: Eve signs a message pretending to be Bob")
+157          alice_pub = next(u for u in eve.users() if u["username"] == "alice")["enc_public_pem"]
+158          forged = encrypt_and_sign("Alice, send me your password. - Bob", "bob", "alice", eve.keys, alice_pub)
+159          print("    eve | built a package with sender='bob' but signed with EVE's private key")
+160          try:
+161              eve.send_package(forged)
+162          except ClientError as exc:
+163              print(f" server | refused: {exc}  (Eve is logged in as eve)")
+164          print("    eve | ...so Eve compromises the server and plants it in Alice's mailbox directly")
+165          with app.db.lock:
+166              app.db.data["messages"].append({"package": forged, "received_at": int(time.time()), "delivered": False})
+167              app.db.save()
+168          alice.trace = step_printer("alice")
+169          for r in alice.inbox():
+170              show_result(r)
+171          alice.trace = quiet
 ```
 
-- **150–151** — Title.
-- **152** — Eve looks up Alice's RSA public key, which anyone may do.
-- **153** — Eve builds a package that says `sender: "bob"` but signs it with **her own** key (she doesn't have Bob's).
-- **154** — Say so.
-- **155–158** — Eve tries to send it; the server refuses because Eve is logged in as `eve`, not `bob`.
-- **159** — Eve "compromises the server" instead…
-- **160–162** — …by writing the forged package straight into the database, as a malicious operator could.
-- **163–166** — Alice checks her inbox: the signature does not match Bob's key, so it is rejected.
+- **155–156** — Title.
+- **157** — Eve looks up Alice's RSA public key, which anyone may do.
+- **158** — Eve builds a package that says `sender: "bob"` but signs it with **her own** key (she doesn't have Bob's).
+- **159** — Say so.
+- **160–163** — Eve tries to send it; the server refuses because Eve is logged in as `eve`, not `bob`.
+- **164** — Eve "compromises the server" instead…
+- **165–167** — …by writing the forged package straight into the database, as a malicious operator could.
+- **168–171** — Alice checks her inbox: the signature does not match Bob's key, so it is rejected.
 
 ### Scenario 5: replay
 
-[`demo.py` lines 168–183](../demo.py#L168-L183)
+[`demo.py` lines 173–188](../demo.py#L173-L188)
 
 ```python
-168          # ------------------------------------------------------------ 5
-169          banner("5. REPLAY TEST: resend Bob's first message")
-170          print(f"   mitm | re-submitting the captured package, msg_id {original['msg_id']}")
-171          try:
-172              bob.send_package(original)
-173              print("  !! server accepted the replay (should not happen)")
-174          except ClientError as exc:
-175              print(f" server | refused: {exc}")
-176          print("   mitm | a malicious server could skip that check and redeliver it anyway:")
-177          with app.db.lock:
-178              app.db.data["messages"].append({"package": original, "received_at": int(time.time()), "delivered": False})
-179              app.db.save()
-180          alice.trace = step_printer("alice")
-181          for r in alice.inbox():
-182              show_result(r)
-183          alice.trace = quiet
+173          # ------------------------------------------------------------ 5
+174          banner("5. REPLAY TEST: resend Bob's first message")
+175          print(f"   mitm | re-submitting the captured package, msg_id {original['msg_id']}")
+176          try:
+177              bob.send_package(original)
+178              print("  !! server accepted the replay (should not happen)")
+179          except ClientError as exc:
+180              print(f" server | refused: {exc}")
+181          print("   mitm | a malicious server could skip that check and redeliver it anyway:")
+182          with app.db.lock:
+183              app.db.data["messages"].append({"package": original, "received_at": int(time.time()), "delivered": False})
+184              app.db.save()
+185          alice.trace = step_printer("alice")
+186          for r in alice.inbox():
+187              show_result(r)
+188          alice.trace = quiet
 ```
 
-- **168–169** — Title.
-- **170** — Pretend someone captured Bob's first package.
-- **171–175** — Re-submit it: the server refuses the duplicate message ID.
-- **176** — A malicious server could skip that check…
-- **177–179** — …so plant the same package in Alice's mailbox again.
-- **180–183** — Alice's client recognizes the ID from `seen_ids` and rejects it.
+- **173–174** — Title.
+- **175** — Pretend someone captured Bob's first package.
+- **176–180** — Re-submit it: the server refuses the duplicate message ID.
+- **181** — A malicious server could skip that check…
+- **182–184** — …so plant the same package in Alice's mailbox again.
+- **185–188** — Alice's client recognizes the ID from `seen_ids` and rejects it.
 
 ### Scenario 6: wrong password
 
-[`demo.py` lines 185–200](../demo.py#L185-L200)
+[`demo.py` lines 190–205](../demo.py#L190-L205)
 
 ```python
-185          # ------------------------------------------------------------ 6
-186          banner("6. WRONG PASSWORD TEST: the error never says which field was wrong")
-187          for label, user, pw in [
-188              ("right user, wrong password", "alice", "not-alices-password"),
-189              ("unknown user", "mallory", "whatever-password"),
-190          ]:
-191              c = new_client("guest")
-192              t0 = time.perf_counter()
-193              try:
-194                  c.login(user, pw)
-195                  print("  !! login succeeded (should not happen)")
-196              except ClientError as exc:
-197                  ms = (time.perf_counter() - t0) * 1000
-198                  print(f"  {label:<28} -> \"{exc}\"  ({ms:.0f} ms)")
-199              c.close()
-200          print("  Same message, similar time: an attacker cannot learn whether 'alice' exists.")
+190          # ------------------------------------------------------------ 6
+191          banner("6. WRONG PASSWORD TEST: the error never says which field was wrong")
+192          for label, user, pw in [
+193              ("right user, wrong password", "alice", "not-alices-password"),
+194              ("unknown user", "mallory", "whatever-password"),
+195          ]:
+196              c = new_client("guest")
+197              t0 = time.perf_counter()
+198              try:
+199                  c.login(user, pw)
+200                  print("  !! login succeeded (should not happen)")
+201              except ClientError as exc:
+202                  ms = (time.perf_counter() - t0) * 1000
+203                  print(f"  {label:<28} -> \"{exc}\"  ({ms:.0f} ms)")
+204              c.close()
+205          print("  Same message, similar time: an attacker cannot learn whether 'alice' exists.")
 ```
 
-- **185–186** — Title.
-- **187–190** — Two attempts: Alice with the wrong password, and a user who doesn't exist.
-- **191** — A fresh client for each attempt.
-- **192** — Start a timer.
-- **193–195** — Try to log in (it must fail).
-- **196–198** — Print the error message and how long it took.
-- **199** — Close.
-- **200** — The point: same message, similar time.
+- **190–191** — Title.
+- **192–195** — Two attempts: Alice with the wrong password, and a user who doesn't exist.
+- **196** — A fresh client for each attempt.
+- **197** — Start a timer.
+- **198–200** — Try to log in (it must fail).
+- **201–203** — Print the error message and how long it took.
+- **204** — Close.
+- **205** — The point: same message, similar time.
 
 ### Scenario 7: the database is stolen
 
-[`demo.py` lines 202–218](../demo.py#L202-L218)
+[`demo.py` lines 207–224](../demo.py#L207-L224)
 
 ```python
-202          # ------------------------------------------------------------ 7
-203          banner("7. DATABASE LEAK TEST: an attacker steals db.json")
-204          with open(db_path, encoding="utf-8") as f:
-205              stolen = json.load(f)
-206          stored = stolen["users"]["alice"]["password"]
-207          print("  a) Log in using the stolen hash (or salt+hash) as the password:")
-208          for attempt in (stored["hash"], stored["salt"] + "$" + stored["hash"], json.dumps(stored)):
-209              c = new_client("thief")
-210              try:
-211                  c.login("alice", attempt)
-212                  print("  !! login succeeded (should not happen)")
-213              except ClientError as exc:
-214                  print(f"     tried {attempt[:40]!r:<44} -> {exc}")
-215              c.close()
-216          print("     The server hashes whatever it receives; a hash of a hash never matches.")
-217          print("     To get in, the attacker must guess the real password, and each scrypt guess")
-218          print("     costs ~32 MiB of memory and real time.")
+207          # ------------------------------------------------------------ 7
+208          banner("7. DATABASE LEAK TEST: an attacker steals db.json")
+209          bob.send("alice", "Bank PIN reminder: do not share it")  # a message waiting on the server when it is stolen
+210          with open(db_path, encoding="utf-8") as f:
+211              stolen = json.load(f)
+212          stored = stolen["users"]["alice"]["password"]
+213          print("  a) Log in using the stolen hash (or salt+hash) as the password:")
+214          for attempt in (stored["hash"], stored["salt"] + "$" + stored["hash"], json.dumps(stored)):
+215              c = new_client("thief")
+216              try:
+217                  c.login("alice", attempt)
+218                  print("  !! login succeeded (should not happen)")
+219              except ClientError as exc:
+220                  print(f"     tried {attempt[:40]!r:<44} -> {exc}")
+221              c.close()
+222          print("     The server hashes whatever it receives; a hash of a hash never matches.")
+223          print("     To get in, the attacker must guess the real password, and each scrypt guess")
+224          print("     costs ~32 MiB of memory and real time.")
 ```
 
-- **202–203** — Title.
-- **204–205** — Read the database file as a thief would.
-- **206** — Alice's password record.
-- **207** — Part (a).
-- **208** — Try logging in with the stored hash, with salt and hash joined, and with the whole record.
-- **209–215** — Each attempt goes through the normal client (which hashes it as if it were a password) and fails.
-- **216–218** — Why: the server hashes whatever it receives, so a stolen hash is just another wrong password, and guessing the real password costs a full scrypt per guess.
+- **207–208** — Title.
+- **209** — Bob sends a message that is still waiting on the server when the thief copies the database.
+- **210–211** — Read the database file as a thief would.
+- **212** — Alice's password record.
+- **213** — Part (a).
+- **214** — Try logging in with the stored hash, with salt and hash joined, and with the whole record.
+- **215–221** — Each attempt goes through the normal client (which hashes it as if it were a password) and fails.
+- **222–224** — Why: the server hashes whatever it receives, so a stolen hash is just another wrong password, and guessing the real password costs a full scrypt per guess.
 
-[`demo.py` lines 220–236](../demo.py#L220-L236)
+[`demo.py` lines 226–242](../demo.py#L226-L242)
 
 ```python
-220          print("\n  b) Read the stolen messages:")
-221          msg = stolen["messages"][0]["package"]
-222          print(f"     ciphertext (base64): {msg['ciphertext'][:60]}...")
-223          print("     The server never had a private key, so the database contains none.")
-224          print("     Try unwrapping the AES key with some other private key (Eve's):")
-225          try:
-226              eve.keys.enc_private.decrypt(b64d(msg["wrapped_key"]), OAEP)
-227              print("  !! unwrapped (should not happen)")
-228          except ValueError:
-229              print("     RSA-OAEP decryption failed -> AES key stays secret -> message stays secret")
-230          print("     Try a fresh random key pair (what an attacker without Alice's device has):")
+226          print("\n  b) Read the stolen messages:")
+227          msg = stolen["messages"][0]["package"]
+228          print(f"     ciphertext (base64): {msg['ciphertext'][:60]}...")
+229          print("     The server never had a private key, so the database contains none.")
+230          print("     Try unwrapping the AES key with some other private key (Eve's):")
 231          try:
-232              UserKeys.generate().enc_private.decrypt(b64d(msg["wrapped_key"]), OAEP)
+232              eve.keys.enc_private.decrypt(b64d(msg["wrapped_key"]), OAEP)
 233              print("  !! unwrapped (should not happen)")
 234          except ValueError:
-235              print("     RSA-OAEP decryption failed again.")
-236          print("     Only Alice's private key works, and it lives encrypted on her device.")
+235              print("     RSA-OAEP decryption failed -> AES key stays secret -> message stays secret")
+236          print("     Try a fresh random key pair (what an attacker without Alice's device has):")
+237          try:
+238              UserKeys.generate().enc_private.decrypt(b64d(msg["wrapped_key"]), OAEP)
+239              print("  !! unwrapped (should not happen)")
+240          except ValueError:
+241              print("     RSA-OAEP decryption failed again.")
+242          print("     Only Alice's private key works, and it lives encrypted on her device.")
 ```
 
-- **220** — Part (b).
-- **221–222** — Take the first stored message and show its ciphertext.
-- **223** — Note that the database contains no private keys.
-- **224–229** — Try to unwrap the AES key with Eve's private key: RSA-OAEP fails.
-- **230–235** — Try again with a freshly generated key pair: fails again.
-- **236** — Only Alice's key, on Alice's device, works.
+- **226** — Part (b).
+- **227–228** — Take the first stored message and show its ciphertext.
+- **229** — Note that the database contains no private keys.
+- **230–235** — Try to unwrap the AES key with Eve's private key: RSA-OAEP fails.
+- **236–241** — Try again with a freshly generated key pair: fails again.
+- **242** — Only Alice's key, on Alice's device, works.
 
 ### Scenario 8: eavesdropping and a fake server
 
-[`demo.py` lines 238–259](../demo.py#L238-L259)
+[`demo.py` lines 244–265](../demo.py#L244-L265)
 
 ```python
-238          # ------------------------------------------------------------ 8
-239          banner("8. EAVESDROPPER TEST: someone records all network traffic (TLS 1.3)")
-240          proxy = RecordingProxy(host, port)
-241          print(f"   spy | recording every byte between Bob and the server (proxy port {proxy.port})")
-242          bob2 = ChatClient("127.0.0.1", proxy.port, os.path.join(workdir, "device-bob"),
-243                            trace=quiet, ca_file=srv.ca_file)
-244          print(f"   bob | connected: {bob2.conn.tls_version}, {bob2.conn.cipher}, server certificate verified")
-245          bob2.login("bob", PASSWORDS["bob"])
-246          bob2.send("alice", "Secret plan: launch on Friday")
-247          bob2.close()
-248          time.sleep(0.3)
-249          seen = proxy.everything
-250          proxy.close()
-251          print(f"   spy | captured {len(seen)} bytes; first 48 as hex: {seen[5:53].hex()}")
-252          login_hash = client_password_hash("bob", PASSWORDS["bob"])
-253          for label, needle in [("Bob's password", PASSWORDS["bob"]), ("Bob's login hash", login_hash),
-254                                ("the word 'password_hash'", "password_hash"), ("the username 'bob'", "bob"),
-255                                ("the recipient 'alice'", "alice"), ("the message text", "Secret plan")]:
-256              print(f"   spy | can I find {label + '?':<28} {needle.encode() in seen}")
-257          print("        |     Without TLS, the login hash would be readable here and could be replayed")
-258          print("        |     to log in as Bob. With TLS the spy only has random-looking bytes, and")
-259          print("        |     replaying them fails because every TLS 1.3 connection uses fresh keys.")
+244          # ------------------------------------------------------------ 8
+245          banner("8. EAVESDROPPER TEST: someone records all network traffic (TLS 1.3)")
+246          proxy = RecordingProxy(host, port)
+247          print(f"   spy | recording every byte between Bob and the server (proxy port {proxy.port})")
+248          bob2 = ChatClient("127.0.0.1", proxy.port, os.path.join(workdir, "device-bob"),
+249                            trace=quiet, ca_file=srv.ca_file)
+250          print(f"   bob | connected: {bob2.conn.tls_version}, {bob2.conn.cipher}, server certificate verified")
+251          bob2.login("bob", PASSWORDS["bob"])
+252          bob2.send("alice", "Secret plan: launch on Friday")
+253          bob2.close()
+254          time.sleep(0.3)
+255          seen = proxy.everything
+256          proxy.close()
+257          print(f"   spy | captured {len(seen)} bytes; first 48 as hex: {seen[5:53].hex()}")
+258          login_hash = client_password_hash("bob", PASSWORDS["bob"])
+259          for label, needle in [("Bob's password", PASSWORDS["bob"]), ("Bob's login hash", login_hash),
+260                                ("the word 'password_hash'", "password_hash"), ("the username 'bob'", "bob"),
+261                                ("the recipient 'alice'", "alice"), ("the message text", "Secret plan")]:
+262              print(f"   spy | can I find {label + '?':<28} {needle.encode() in seen}")
+263          print("        |     Without TLS, the login hash would be readable here and could be replayed")
+264          print("        |     to log in as Bob. With TLS the spy only has random-looking bytes, and")
+265          print("        |     replaying them fails because every TLS 1.3 connection uses fresh keys.")
 ```
 
-- **238–239** — Title.
-- **240** — Start a recording proxy in front of the real server.
-- **241** — Say what it does.
-- **242–243** — Bob connects **through the proxy** (same device folder, so his keys are there).
-- **244** — Show the TLS version and cipher, and that the certificate was verified.
-- **245** — Bob logs in through the proxy.
-- **246** — Bob sends a message through the proxy.
-- **247** — Disconnect.
-- **248** — Give the proxy a moment to finish copying.
-- **249** — Everything the proxy saw, in both directions.
-- **250** — Stop the proxy.
-- **251** — Print how many bytes were captured and a sample in hex: unreadable.
-- **252** — Compute Bob's login hash, to search for it.
-- **253–256** — Search the capture for the password, the login hash, the field name, both usernames and the message text, and print the result (all `False`).
-- **257–259** — Explain why this matters: without TLS the login hash could be copied and replayed.
+- **244–245** — Title.
+- **246** — Start a recording proxy in front of the real server.
+- **247** — Say what it does.
+- **248–249** — Bob connects **through the proxy** (same device folder, so his keys are there).
+- **250** — Show the TLS version and cipher, and that the certificate was verified.
+- **251** — Bob logs in through the proxy.
+- **252** — Bob sends a message through the proxy.
+- **253** — Disconnect.
+- **254** — Give the proxy a moment to finish copying.
+- **255** — Everything the proxy saw, in both directions.
+- **256** — Stop the proxy.
+- **257** — Print how many bytes were captured and a sample in hex: unreadable.
+- **258** — Compute Bob's login hash, to search for it.
+- **259–262** — Search the capture for the password, the login hash, the field name, both usernames and the message text, and print the result (all `False`).
+- **263–265** — Explain why this matters: without TLS the login hash could be copied and replayed.
 
-[`demo.py` lines 261–274](../demo.py#L261-L274)
+[`demo.py` lines 267–280](../demo.py#L267-L280)
 
 ```python
-261          print("\n   spy | now pretending to BE the server, with a certificate from my own CA:")
-262          fake_dir = os.path.join(workdir, "attacker-tls")
-263          fake_paths = generate_server_tls(fake_dir, ("localhost", "127.0.0.1"))
-264          fake = ThreadedServer(("127.0.0.1", 0), ChatApp(os.path.join(fake_dir, "db.json")),
-265                                server_context(fake_paths["cert"], fake_paths["key"]))
-266          threading.Thread(target=fake.serve_forever, daemon=True).start()
-267          try:
-268              ChatClient("127.0.0.1", fake.server_address[1], os.path.join(workdir, "device-bob"),
-269                         trace=quiet, ca_file=srv.ca_file)
-270              print("  !! connected to the fake server (should not happen)")
-271          except ConnectionError_ as exc:
-272              print(f"   bob | {exc}")
-273          finally:
-274              fake.stop()
+267          print("\n   spy | now pretending to BE the server, with a certificate from my own CA:")
+268          fake_dir = os.path.join(workdir, "attacker-tls")
+269          fake_paths = generate_server_tls(fake_dir, ("localhost", "127.0.0.1"))
+270          fake = ThreadedServer(("127.0.0.1", 0), ChatApp(os.path.join(fake_dir, "db.json")),
+271                                server_context(fake_paths["cert"], fake_paths["key"]))
+272          threading.Thread(target=fake.serve_forever, daemon=True).start()
+273          try:
+274              ChatClient("127.0.0.1", fake.server_address[1], os.path.join(workdir, "device-bob"),
+275                         trace=quiet, ca_file=srv.ca_file)
+276              print("  !! connected to the fake server (should not happen)")
+277          except ConnectionError_ as exc:
+278              print(f"   bob | {exc}")
+279          finally:
+280              fake.stop()
 ```
 
-- **261** — Now the spy pretends to **be** the server.
-- **262** — A folder for the attacker's certificates.
-- **263** — The attacker makes their own CA and a certificate for `localhost`/`127.0.0.1`, valid as far as the attacker is concerned.
-- **264–265** — A complete chat server using the attacker's certificate.
-- **266** — Run it in the background.
-- **267–269** — Bob tries to connect to it, trusting only the real CA.
-- **270** — If that worked it would be a failure of the design (it doesn't).
-- **271–272** — The client refuses with its security warning, before sending anything.
-- **273–274** — Stop the fake server.
+- **267** — Now the spy pretends to **be** the server.
+- **268** — A folder for the attacker's certificates.
+- **269** — The attacker makes their own CA and a certificate for `localhost`/`127.0.0.1`, valid as far as the attacker is concerned.
+- **270–271** — A complete chat server using the attacker's certificate.
+- **272** — Run it in the background.
+- **273–275** — Bob tries to connect to it, trusting only the real CA.
+- **276** — If that worked it would be a failure of the design (it doesn't).
+- **277–278** — The client refuses with its security warning, before sending anything.
+- **279–280** — Stop the fake server.
 
-[`demo.py` lines 276–285](../demo.py#L276-L285)
+### Scenario 9: privacy mechanisms
+
+[`demo.py` lines 282–299](../demo.py#L282-L299)
 
 ```python
-276          banner("DONE: all eight scenarios behaved as expected")
-277      finally:
-278          for c in list(locals().get("clients", {}).values()):
-279              c.close()
-280          srv.stop()
-281          shutil.rmtree(workdir, ignore_errors=True)
-282  
-283  
-284  if __name__ == "__main__":
-285      main()
+282          # ------------------------------------------------------------ 9
+283          banner("9. PRIVACY: pseudonymous logs, access to my data, erasure")
+284          pseudo = app.pseudo
+285          print("   log | the server log never shows names or IP addresses, only keyed pseudonyms:")
+286          for name in ("alice", "bob", "eve"):
+287              print(f"        |     {name:<5} appears in the log as {pseudo.user(name)}")
+288          print(f"        |     127.0.0.1 appears in the log as {pseudo.ip('127.0.0.1')}")
+289          print("        |     only the holder of server_data/privacy/log_key can map them back")
+290          print(f"        |     (conditional re-identification): {pseudo.user('bob')} -> "
+291                f"{pseudo.reidentify(pseudo.user('bob'), ['alice', 'bob', 'eve'])}")
+292          data = eve.mydata()
+293          print("    eve | mydata (right of access, as JSON):")
+294          for key in ("username", "consent", "messages_waiting_for_you", "retention", "log_pseudonym"):
+295              print(f"        |     {key}: {data[key]}")
+296          eve.delete_account(PASSWORDS["eve"])
+297          print("    eve | delete_account: account, waiting messages and local keys erased")
+298          with open(db_path, encoding="utf-8") as f:
+299              print(f" server | is 'eve' still in the database?  {'eve' in json.load(f)['users']}")
 ```
 
-- **276** — Final banner.
-- **277** — Cleanup, run even if a scenario failed.
-- **278–279** — Close every client.
-- **280** — Stop the server.
-- **281** — Delete the temporary folder.
-- **284–285** — Run `main()` when executed as a program.
+- **282–283** — Title.
+- **284** — The server's log pseudonymizer.
+- **285** — Explain what the log shows.
+- **286–287** — Show the pseudonym each user appears under in the log.
+- **288** — Show the pseudonym for the IP address `127.0.0.1`.
+- **289** — Only the holder of the secret log key can map pseudonyms back.
+- **290–291** — Demonstrate conditional re-identification: with the key and the list of users, Bob's pseudonym maps back to `bob`.
+- **292** — Eve asks for everything the server stores about her (right of access).
+- **293–295** — Print the main fields: username, consent record, waiting messages, retention rule and her log pseudonym.
+- **296** — Eve erases her account (right to erasure), re-confirming with her password.
+- **297** — Say what was erased.
+- **298–299** — Read the database again: `eve` is gone.
+
+[`demo.py` lines 301–310](../demo.py#L301-L310)
+
+```python
+301          banner("DONE: all nine scenarios behaved as expected")
+302      finally:
+303          for c in list(locals().get("clients", {}).values()):
+304              c.close()
+305          srv.stop()
+306          shutil.rmtree(workdir, ignore_errors=True)
+307  
+308  
+309  if __name__ == "__main__":
+310      main()
+```
+
+- **301** — Final banner.
+- **302** — Cleanup, run even if a scenario failed.
+- **303–304** — Close every client.
+- **305** — Stop the server.
+- **306** — Delete the temporary folder.
+- **309–310** — Run `main()` when executed as a program.
 
 ## 5.2 `tests/mitm.py`, line by line
 
@@ -664,7 +712,7 @@ A small proxy that plays the network attacker in the tests and the demo.
 
 ## 5.3 What each automated test proves
 
-70 tests in three files. Each end-to-end test starts a real TLS server on a free port with
+79 tests in four files. Each end-to-end test starts a real TLS server on a free port with
 a temporary database and talks to it over real sockets.
 
 ### `tests/test_security.py` (25 tests): each protection works
@@ -710,6 +758,20 @@ a temporary database and talks to it over real sockets.
 | `test_connection_uses_tls13` | The negotiated version is TLS 1.3 |
 | `test_missing_or_bad_ca_file` | A missing or junk `ca.crt` gives a clear error |
 | `test_ca_private_key_is_not_kept` | The TLS folder holds exactly `ca.crt`, `server.crt`, `server.key`, and no CA private key |
+
+### `tests/test_privacy.py` (9 tests): personal data handling
+
+| Test | What it proves |
+|---|---|
+| `test_server_log_has_no_usernames_or_ip_addresses` | After signups, logins, a message and a failed login, the captured server log contains no username and no IP address, only their pseudonyms |
+| `test_reidentification_needs_the_key` | The key holder maps a pseudonym back to the name; a different key cannot; pseudonyms stay the same after a restart |
+| `test_reidentify_command` | `py -m server.reidentify` finds the user with the real key, and finds nothing without it |
+| `test_delivered_messages_are_deleted_from_the_server` | A message disappears from the database once read; only its random ID remains, so a replay is still refused |
+| `test_undelivered_messages_expire_after_retention_period` | A message just inside 30 days is kept; just past 30 days it is deleted |
+| `test_privacy_notice_is_available_before_login` | The notice can be read without an account and covers what, why, how long and rights |
+| `test_signup_requires_accepting_the_current_notice` | Signup without consent, or with an old notice version, stores nothing; a normal signup records the version |
+| `test_mydata_shows_my_data_but_not_the_password_hash` | `mydata` returns the caller's own data and counts, never the stored hash or salt, nothing about other people, and needs a login |
+| `test_delete_account_erases_everything` | A wrong password erases nothing; the right one removes the account, messages to and from it and the local key folder, and the account can no longer log in |
 
 ### `tests/test_edge_cases.py` (36 tests): extreme and hostile input
 

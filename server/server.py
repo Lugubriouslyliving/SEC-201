@@ -38,6 +38,7 @@ from crypto_utils.keys import load_enc_public, load_sign_public
 from crypto_utils.passwords import DUMMY_RECORD, hash_password, is_login_hash, verify_password
 from crypto_utils.tls import DEFAULT_HOSTNAMES, certificate_fingerprint, ensure_server_tls, server_context
 
+from .privacy import PRIVACY_NOTICE, PRIVACY_NOTICE_VERSION, RETENTION_DAYS, Pseudonymizer, purge_expired
 from .storage import Storage
 
 log = logging.getLogger("server")
@@ -81,7 +82,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
             pass  # client already gone
 
     def handle(self):
-        peer = "%s:%s" % self.client_address
+        peer = self.server.app.pseudo.ip(self.client_address[0])  # never log the real IP address
         log.info("connection from %s", peer)
         try:
             self._serve()
@@ -119,20 +120,28 @@ class ChatApp:
 
     def __init__(self, db_path: str):
         self.db = Storage(db_path)
+        # The secret key for log pseudonyms lives next to the database, never in the log.
+        self.pseudo = Pseudonymizer(os.path.join(os.path.dirname(os.path.abspath(db_path)), "privacy", "log_key"))
+        with self.db.lock:  # apply the retention rule to whatever is already stored
+            if purge_expired(self.db.data):
+                self.db.save()
 
     def dispatch(self, conn: RequestHandler, req: dict) -> dict:
         action = req.get("action")
         handlers = {
+            "privacy_notice": self.privacy_notice,
             "signup": self.signup,
             "login": self.login,
             "users": self.users,
             "send": self.send,
             "inbox": self.inbox,
+            "mydata": self.mydata,
+            "delete_account": self.delete_account,
             "logout": self.logout,
         }
         if not isinstance(action, str) or action not in handlers:
             return {"ok": False, "error": "Unknown action."}
-        if action in ("users", "send", "inbox") and conn.user is None:
+        if action in ("users", "send", "inbox", "mydata", "delete_account") and conn.user is None:
             return {"ok": False, "error": "Please log in first."}
         try:
             return handlers[action](conn, req)
@@ -164,6 +173,9 @@ class ChatApp:
             load_sign_public(sign_pem)
         except Exception:
             return {"ok": False, "error": "Public keys must be a PEM RSA key (2048+ bits) and a PEM Ed25519 key."}
+        # PDPA s.19/s.23: the user must have seen and accepted the current privacy notice.
+        if req.get("consent_version") != PRIVACY_NOTICE_VERSION:
+            return {"ok": False, "error": "You must accept the current privacy notice to sign up."}
 
         with SCRYPT_SLOTS:
             record = hash_password(login_hash)  # salted again with a random salt; slow, so outside the lock
@@ -175,10 +187,11 @@ class ChatApp:
                 "enc_public_pem": enc_pem,
                 "sign_public_pem": sign_pem,
                 "created": int(time.time()),
+                "consent": {"notice_version": PRIVACY_NOTICE_VERSION, "accepted_at": int(time.time())},
             }
             self.db.save()
         conn.user = username
-        log.info("signup: %s", username)
+        log.info("signup: %s", self.pseudo.user(username))
         return {"ok": True, "username": username}
 
     def login(self, conn, req):
@@ -198,7 +211,7 @@ class ChatApp:
             # One message for "no such user" and "wrong password".
             return {"ok": False, "error": GENERIC_LOGIN_ERROR}
         conn.user = username
-        log.info("login: %s", username)
+        log.info("login: %s", self.pseudo.user(username))
         return {"ok": True, "username": username}
 
     def logout(self, conn, req):
@@ -237,7 +250,7 @@ class ChatApp:
         # The logged-in user may only send as themselves. (Recipients still
         # verify the signature: they must not have to trust the server.)
         if pkg["sender"] != conn.user:
-            log.warning("rejected: %s tried to send as %r", conn.user, pkg["sender"][:40])
+            log.warning("rejected: %s tried to send as someone else", self.pseudo.user(conn.user))
             return {"ok": False, "error": "Sender does not match the logged-in user."}
         ts = pkg["timestamp"]
         # `type(...) is int` excludes True/False; the range check comes before any
@@ -255,11 +268,12 @@ class ChatApp:
                 return {"ok": False, "error": f"Duplicate message ID {pkg['msg_id']}: replay rejected."}
             self.db.seen.add(pkg["msg_id"])
             self.db.data["seen_msg_ids"].append(pkg["msg_id"])
+            purge_expired(self.db.data)  # retention: drop anything past its time before adding more
             # Stored exactly as received: still encrypted, still signed.
             self.db.data["messages"].append({"package": pkg, "received_at": int(time.time()), "delivered": False})
             self.db.save()
-        log.info("stored message %s from %s to %s (%d bytes of ciphertext, base64)",
-                 pkg["msg_id"], pkg["sender"], pkg["recipient"], len(pkg["ciphertext"]))
+        log.info("stored message %s from %s to %s (%d bytes of ciphertext, base64)", pkg["msg_id"],
+                 self.pseudo.user(pkg["sender"]), self.pseudo.user(pkg["recipient"]), len(pkg["ciphertext"]))
         return {"ok": True, "msg_id": pkg["msg_id"]}
 
     def inbox(self, conn, req):
@@ -274,8 +288,61 @@ class ChatApp:
                 out.append(pkg)
                 entry["delivered"] = True
             if out:
+                purge_expired(self.db.data)  # retention: delivered packages are deleted right away
                 self.db.save()
         return {"ok": True, "messages": out}
+
+    # ------------------------------------------------------------ privacy rights (PDPA)
+
+    def privacy_notice(self, conn, req):
+        """PDPA s.23: tell people what is collected and why, before they sign up."""
+        return {"ok": True, "version": PRIVACY_NOTICE_VERSION, "text": PRIVACY_NOTICE}
+
+    def mydata(self, conn, req):
+        """PDPA s.30 (access) and s.31 (portability): everything stored about the caller, as JSON."""
+        with self.db.lock:
+            u = self.db.data["users"][conn.user]
+            waiting_for_me = sum(1 for e in self.db.data["messages"] if _party(e, "recipient") == conn.user)
+            sent_waiting = sum(1 for e in self.db.data["messages"] if _party(e, "sender") == conn.user)
+            record = {
+                "username": conn.user,
+                "created": u["created"],
+                "consent": u.get("consent"),
+                "enc_public_pem": u["enc_public_pem"],
+                "sign_public_pem": u["sign_public_pem"],
+                "password": "stored only as scrypt(login hash, random salt); not shown so a stolen session cannot take it",
+                "messages_waiting_for_you": waiting_for_me,
+                "messages_you_sent_still_waiting": sent_waiting,
+                "retention": f"delivered messages are deleted at once; undelivered ones after {RETENTION_DAYS} days",
+                "log_pseudonym": self.pseudo.user(conn.user),
+            }
+        return {"ok": True, "data": record}
+
+    def delete_account(self, conn, req):
+        """PDPA s.33 (erasure): remove the account and every message to or from it.
+        The password is asked again, so someone at an unlocked screen cannot do it."""
+        login_hash = req["password_hash"]
+        with self.db.lock:
+            user = self.db.data["users"].get(conn.user)
+        with SCRYPT_SLOTS:
+            ok = user is not None and is_login_hash(login_hash) and verify_password(login_hash, user["password"])
+        if not ok:
+            return {"ok": False, "error": GENERIC_LOGIN_ERROR}
+        name = conn.user
+        with self.db.lock:
+            del self.db.data["users"][name]
+            self.db.data["messages"] = [e for e in self.db.data["messages"]
+                                        if name not in (_party(e, "sender"), _party(e, "recipient"))]
+            self.db.save()
+        conn.user = None
+        log.info("account deleted: %s", self.pseudo.user(name))
+        return {"ok": True}
+
+
+def _party(entry, field):
+    """The sender or recipient of a stored message entry, or None if the entry is malformed."""
+    pkg = entry.get("package") if isinstance(entry, dict) else None
+    return pkg.get(field) if isinstance(pkg, dict) else None
 
 
 class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -299,10 +366,11 @@ class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         """A connection that fails (e.g. a failed TLS handshake) is closed quietly
         instead of printing a traceback; the server carries on."""
         exc = sys.exc_info()[1]
+        peer = self.app.pseudo.ip(client_address[0])  # pseudonym, not the real IP
         if isinstance(exc, (ssl.SSLError, OSError)):
-            log.info("dropped connection from %s:%s (%s)", *client_address, exc.__class__.__name__)
+            log.info("dropped connection from %s (%s)", peer, exc.__class__.__name__)
         else:
-            log.exception("error on connection from %s:%s", *client_address)
+            log.exception("error on connection from %s", peer)
 
     def track(self, sock):
         with self._conn_lock:

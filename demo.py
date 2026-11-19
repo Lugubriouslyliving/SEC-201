@@ -1,6 +1,6 @@
 """Guided demonstration: every protection, step by step, in the terminal.
 
-Run:  py demo.py            (all eight scenarios)
+Run:  py demo.py            (all nine scenarios)
       py demo.py --pause    (wait for Enter between scenarios, good for presenting)
 
 The demo starts its own server on a free port with a throwaway database in
@@ -107,6 +107,7 @@ def main():
 
         # ------------------------------------------------------------ 2
         banner("2. SERVER VIEW: what the server actually stores")
+        bob.send("alice", "Lunch at noon? The meeting room is booked.")  # waiting, so it is still stored
         with open(db_path, encoding="utf-8") as f:
             db = json.load(f)
         print("  users table (alice):")
@@ -121,9 +122,13 @@ def main():
             print(f"    {k:<12} {text[:60]}{'...' if len(text) > 60 else ''}")
         raw = json.dumps(db)
         print(f"\n  Does the word 'meeting' appear anywhere in the database?  {'meeting' in raw}")
+        print(f"  Does the word 'Lunch' appear anywhere in the database?  {'Lunch' in raw}")
         print("  Does any password appear in it?  "
               f"{any(p in raw for p in PASSWORDS.values())}")
         print("  Server keeps: salted hashes, public keys, ciphertext, and metadata (who, to whom, when).")
+        alice.inbox()  # Alice reads it; the server deletes delivered messages at once (retention)
+        with open(db_path, encoding="utf-8") as f:
+            print(f"  After Alice reads it, messages stored on the server: {len(json.load(f)['messages'])}")
 
         # ------------------------------------------------------------ 3
         banner("3. TAMPERING TEST: flip one byte of the ciphertext in transit")
@@ -201,6 +206,7 @@ def main():
 
         # ------------------------------------------------------------ 7
         banner("7. DATABASE LEAK TEST: an attacker steals db.json")
+        bob.send("alice", "Bank PIN reminder: do not share it")  # a message waiting on the server when it is stolen
         with open(db_path, encoding="utf-8") as f:
             stolen = json.load(f)
         stored = stolen["users"]["alice"]["password"]
@@ -273,7 +279,26 @@ def main():
         finally:
             fake.stop()
 
-        banner("DONE: all eight scenarios behaved as expected")
+        # ------------------------------------------------------------ 9
+        banner("9. PRIVACY: pseudonymous logs, access to my data, erasure")
+        pseudo = app.pseudo
+        print("   log | the server log never shows names or IP addresses, only keyed pseudonyms:")
+        for name in ("alice", "bob", "eve"):
+            print(f"        |     {name:<5} appears in the log as {pseudo.user(name)}")
+        print(f"        |     127.0.0.1 appears in the log as {pseudo.ip('127.0.0.1')}")
+        print("        |     only the holder of server_data/privacy/log_key can map them back")
+        print(f"        |     (conditional re-identification): {pseudo.user('bob')} -> "
+              f"{pseudo.reidentify(pseudo.user('bob'), ['alice', 'bob', 'eve'])}")
+        data = eve.mydata()
+        print("    eve | mydata (right of access, as JSON):")
+        for key in ("username", "consent", "messages_waiting_for_you", "retention", "log_pseudonym"):
+            print(f"        |     {key}: {data[key]}")
+        eve.delete_account(PASSWORDS["eve"])
+        print("    eve | delete_account: account, waiting messages and local keys erased")
+        with open(db_path, encoding="utf-8") as f:
+            print(f" server | is 'eve' still in the database?  {'eve' in json.load(f)['users']}")
+
+        banner("DONE: all nine scenarios behaved as expected")
     finally:
         for c in list(locals().get("clients", {}).values()):
             c.close()

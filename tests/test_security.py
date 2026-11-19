@@ -319,7 +319,7 @@ class EndToEndTests(unittest.TestCase):
             finally:
                 c.close()
         output = "\n".join(logs.output)
-        self.assertIn("login: alice", output)
+        self.assertIn("login: " + self.srv.app.pseudo.user("alice"), output)  # successes are logged, pseudonymously
         self.assertNotIn("hunter2secret", output)
         self.assertNotIn("failed", output)
 

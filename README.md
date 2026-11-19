@@ -135,21 +135,23 @@ show up when you open the chat (or with `inbox`).
 
 | Command | What it does |
 |---|---|
-| `signup <username>` | Makes two key pairs on this computer, sends only the public keys and a hash of the password to the server, saves the private keys encrypted. |
+| `signup <username>` | Shows the server's privacy notice and continues only if you type `yes`. Then makes two key pairs on this computer, sends only the public keys and a hash of the password to the server, saves the private keys encrypted. |
 | `login <username>` | Sends a hash of the password for the server to check; the client unlocks the private keys with the password locally. |
 | `users` | Lists other users with a fingerprint of their public keys. |
 | `chat <username>` | Live conversation. Type to send; incoming messages appear as they arrive. `/exit` leaves. |
 | `send <recipient> <message>` | Encrypts, signs, and sends a single message. |
 | `inbox` | Fetches new messages; verifies each signature, then decrypts. |
 | `verbose on` / `verbose off` | Show or hide each crypto step. |
+| `mydata` | Shows everything the server stores about you, as JSON (PDPA right of access). |
+| `delete_account` | After you retype your username and password, erases your account, every message to or from you, and your keys on this device (PDPA right to erasure). |
 | `logout`, `quit` | |
 
 Passwords are typed with `getpass`, so they are not shown on screen.
 
 ## 3. Running the demo and tests
 
-**Guided demo**, eight scenarios with each step printed (the seven required ones
-plus a network eavesdropper):
+**Guided demo**, nine scenarios with each step printed (the seven required ones,
+plus a network eavesdropper and the privacy mechanisms):
 
 ```powershell
 py demo.py
@@ -164,13 +166,13 @@ py demo.py --pause
 The demo starts its own server on a free port with a temporary database and deletes
 it at the end, so it does not touch `server_data` or `client_data`.
 
-**Automated tests** (70 tests, about 70 seconds):
+**Automated tests** (79 tests, about 80 seconds):
 
 ```powershell
 py -m unittest -v
 ```
 
-The tests are in three files:
+The tests are in four files:
 
 - `tests/test_security.py` (25 tests) checks that each protection works: the seven
   scenarios below, unit tests of the crypto code, and two password checks: every
@@ -189,6 +191,11 @@ The tests are in three files:
 | Missing or junk `ca.crt` | Clear error |
 | The CA's private key | Not stored anywhere |
 
+- `tests/test_privacy.py` (9 tests) checks how personal data is handled: the server log
+  contains no usernames or IP addresses (only keyed pseudonyms), only the key holder can
+  re-identify them, delivered messages are deleted and undelivered ones expire after 30
+  days, sign-up requires accepting the current privacy notice, and `mydata` and
+  `delete_account` work as the PDPA requires.
 - `tests/test_edge_cases.py` (36 tests) checks that the app keeps working under
   extreme or hostile conditions:
 
@@ -289,6 +296,15 @@ The code for steps 1-3 is `encrypt_and_sign` and for steps 5-8 is
   unwraps it.
 - The server stores and forwards ciphertext only. It holds no private key, so it
   could not decrypt even if it wanted to.
+- **Retention:** the server deletes each package as soon as it is delivered, and after
+  30 days if nobody collects it. Only random message IDs are kept, for replay checks.
+- **Pseudonymous logs (conditional privacy):** the server log never shows usernames or
+  IP addresses, only keyed pseudonyms such as `u-e78032f543`. Only the holder of the
+  secret key in `server_data/privacy/log_key` can map one back, with
+  `py -m server.reidentify <pseudonym>`.
+- **Notice, consent and rights:** sign-up shows a privacy notice that must be accepted
+  (the server records which version and when); `mydata` shows a user everything held
+  about them; `delete_account` erases it.
 
 ### Integrity (nothing changed, right sender, not a repeat)
 
@@ -337,6 +353,12 @@ Every response has `"ok": true` or `"ok": false, "error": "<message>"`.
 | `{"action":"send","package":{…}}` | yes | `{"ok":true,"msg_id":"…"}` |
 | `{"action":"inbox"}` | yes | `{"ok":true,"messages":[{…package…}]}` (undelivered ones, then marked delivered) |
 | `{"action":"logout"}` | no | `{"ok":true}` |
+| `{"action":"privacy_notice"}` | no | `{"ok":true,"version":"2026-11","text":"…"}` |
+| `{"action":"mydata"}` | yes | `{"ok":true,"data":{"username":…,"created":…,"consent":…,…}}` |
+| `{"action":"delete_account","password_hash":"…"}` | yes | `{"ok":true}` (account and its messages erased; connection logged out) |
+
+`signup` must also include `"consent_version"`: the version of the privacy notice the
+user accepted. The server refuses sign-ups without the current version.
 
 `password_hash` is the client's login hash: base64 of the 32-byte
 `scrypt(password, salt = SHA-256("secure-chat/login-hash/v1:" + username))`, with
@@ -391,9 +413,13 @@ recipient's job, because the recipient should not have to trust the server.
 
 **What is NOT protected (honest limits)**
 
-- **Metadata is visible to the server:** who talks to whom, when, how often, and
-  roughly how long each message is (AES-GCM does not hide length). Hiding this needs
-  much heavier designs (mixnets, padding, onion routing).
+- **Metadata is visible to the server while it runs:** who talks to whom, when, how
+  often, and roughly how long each message is (AES-GCM does not hide length). Deleting
+  delivered messages and pseudonymous logs mean this history is not *kept*, but a
+  malicious running server can still record it. Hiding it fully needs much heavier
+  designs (mixnets, padding, onion routing).
+- **The log key and re-identification:** anyone who gets `server_data/privacy/log_key`
+  can re-identify pseudonyms in the log. Protect it like `server.key`.
 - **TLS is only as good as how `ca.crt` reaches the client.** If an attacker can swap
   the `ca.crt` file you copy to a client, they can pose as the server. Copy it over a
   channel you trust (USB stick, in person) and compare the fingerprint the server
@@ -585,7 +611,9 @@ secure-chat/
 │   └── connection.py   JSON-over-TLS connection, server certificate check
 ├── server/
 │   ├── server.py       threaded TLS server, accounts, store-and-forward
-│   └── storage.py      JSON database with atomic writes
+│   ├── storage.py      JSON database with atomic writes
+│   ├── privacy.py      log pseudonyms, retention, privacy notice
+│   └── reidentify.py   conditional re-identification of a log pseudonym (key holder only)
 ├── crypto_utils/
 │   ├── passwords.py    client login hash + server scrypt hashing + constant-time verify
 │   ├── keys.py         RSA/Ed25519 key pairs, encrypted key file, fingerprints
@@ -596,9 +624,10 @@ secure-chat/
 │   ├── test_security.py    25 tests: each protection (unit + end-to-end over real sockets)
 │   ├── test_edge_cases.py  36 tests: hostile input, extreme values, load, crashes, restarts
 │   ├── test_tls.py         9 tests: eavesdropping, replay, fake servers, TLS versions
+│   ├── test_privacy.py     9 tests: pseudonymous logs, retention, consent, access, erasure
 │   └── mitm.py             recording proxy used as the "eavesdropper"
 ├── docs/               how it works, line-by-line code walkthrough, security analysis
-├── demo.py             guided demonstration of all eight scenarios
+├── demo.py             guided demonstration of all nine scenarios
 ├── requirements.txt
 └── README.md
 ```

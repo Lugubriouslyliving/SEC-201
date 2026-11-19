@@ -178,7 +178,7 @@ three layers:
 
 ### Header, rules and helpers
 
-[`client/session.py` lines 1–22](../client/session.py#L1-L22)
+[`client/session.py` lines 1–23](../client/session.py#L1-L23)
 
 ```python
  1  """Client-side logic: keys on disk, talking to the server, sealing and opening messages.
@@ -193,546 +193,591 @@ three layers:
 10  import json
 11  import os
 12  import re
-13  import sys
-14  import threading
-15  import time
-16  import unicodedata
-17  
-18  from crypto_utils.keys import KeyFileError, UserKeys, fingerprint
-19  from crypto_utils.messages import MessageRejected, encrypt_and_sign, verify_and_decrypt
-20  from crypto_utils.passwords import client_password_hash
-21  
-22  from .connection import DEFAULT_CA_FILE, Connection
+13  import shutil
+14  import sys
+15  import threading
+16  import time
+17  import unicodedata
+18  
+19  from crypto_utils.keys import KeyFileError, UserKeys, fingerprint
+20  from crypto_utils.messages import MessageRejected, encrypt_and_sign, verify_and_decrypt
+21  from crypto_utils.passwords import client_password_hash
+22  
+23  from .connection import DEFAULT_CA_FILE, Connection
 ```
 
 - **1–8** — Module docstring and the three local files per user.
 - **10** — `json` for local files.
 - **11** — `os` for paths and atomic renames.
 - **12** — `re` for the username pattern.
-- **13** — `sys` to print notices to the error stream.
-- **14** — `threading` for the file lock and thread IDs.
-- **15** — `time` to name backups of damaged files.
-- **16** — `unicodedata` to classify characters in `safe_display`.
-- **18** — Key-file error, the key class, and fingerprints.
-- **19** — The message functions.
-- **20** — The client-side login hash.
-- **22** — The connection class and the default CA path.
+- **13** — `shutil` to delete this device's folder when the account is erased.
+- **14** — `sys` to print notices to the error stream.
+- **15** — `threading` for the file lock and thread IDs.
+- **16** — `time` to name backups of damaged files.
+- **17** — `unicodedata` to classify characters in `safe_display`.
+- **19** — Key-file error, the key class, and fingerprints.
+- **20** — The message functions.
+- **21** — The client-side login hash.
+- **23** — The connection class and the default CA path.
 
-[`client/session.py` lines 24–43](../client/session.py#L24-L43)
+[`client/session.py` lines 25–44](../client/session.py#L25-L44)
 
 ```python
-24  # Same rules the server enforces; checked here first so a typo is reported
-25  # instantly instead of after generating keys.
-26  USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
-27  MIN_PASSWORD_LEN = 8
-28  MAX_PASSWORD_LEN = 1024
-29  # About 10 pages of text. Keeps every package far below the server's 1 MB
-30  # request limit even for 3-byte characters (Thai, Chinese) after base64.
-31  MAX_MESSAGE_CHARS = 20_000
-32  
+25  # Same rules the server enforces; checked here first so a typo is reported
+26  # instantly instead of after generating keys.
+27  USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
+28  MIN_PASSWORD_LEN = 8
+29  MAX_PASSWORD_LEN = 1024
+30  # About 10 pages of text. Keeps every package far below the server's 1 MB
+31  # request limit even for 3-byte characters (Thai, Chinese) after base64.
+32  MAX_MESSAGE_CHARS = 20_000
 33  
-34  class ClientError(Exception):
-35      pass
-36  
+34  
+35  class ClientError(Exception):
+36      pass
 37  
-38  def _no_trace(step, detail=""):
-39      pass
-40  
+38  
+39  def _no_trace(step, detail=""):
+40      pass
 41  
-42  def _stderr_notice(text):
-43      print(f"Notice: {text}", file=sys.stderr)
+42  
+43  def _stderr_notice(text):
+44      print(f"Notice: {text}", file=sys.stderr)
 ```
 
-- **24–25** — Comment: these rules mirror the server's, checked locally first.
-- **26** — Same username pattern as the server.
-- **27** — Minimum password length 8. Only the client can enforce this, because the server never sees the password.
-- **28** — Maximum 1,024 characters.
-- **29–30** — Comment: why the message limit.
-- **31** — At most 20,000 characters per message. Even at 3 bytes per character (Thai) plus base64 growth, that stays far below the server's 1 MB request limit.
-- **34–35** — `ClientError` means "this command failed, but the session continues" (unlike `ConnectionError_`).
-- **38–39** — Default "do nothing" trace printer.
-- **42–43** — Default way to show notices: print to the error stream.
+- **25–26** — Comment: these rules mirror the server's, checked locally first.
+- **27** — Same username pattern as the server.
+- **28** — Minimum password length 8. Only the client can enforce this, because the server never sees the password.
+- **29** — Maximum 1,024 characters.
+- **30–31** — Comment: why the message limit.
+- **32** — At most 20,000 characters per message. Even at 3 bytes per character (Thai) plus base64 growth, that stays far below the server's 1 MB request limit.
+- **35–36** — `ClientError` means "this command failed, but the session continues" (unlike `ConnectionError_`).
+- **39–40** — Default "do nothing" trace printer.
+- **43–44** — Default way to show notices: print to the error stream.
 
-[`client/session.py` lines 46–66](../client/session.py#L46-L66)
+[`client/session.py` lines 47–67](../client/session.py#L47-L67)
 
 ```python
-46  _ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
-47  
+47  _ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
 48  
-49  def safe_display(text) -> str:
-50      """Make received text safe to print in a terminal.
-51  
-52      Message text comes from other people. Printed raw, a newline would let
-53      a sender fake a whole extra line ("[12:00] bob: ...") and escape codes
-54      (ESC [ ...) could clear the screen or recolour text. So invisible control
-55      and formatting characters are shown as visible escapes like \\n or \\x1b.
-56      Ordinary text in any language, including emoji, is left alone.
-57      """
-58      out = []
-59      for ch in str(text):
-60          if ch in "‌‍":  # zero-width (non-)joiners: needed by emoji sequences and some scripts
-61              out.append(ch)
-62          elif unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp", "Cs"):
-63              out.append(_ESCAPES.get(ch) or (f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}"))
-64          else:
-65              out.append(ch)
-66      return "".join(out)
+49  
+50  def safe_display(text) -> str:
+51      """Make received text safe to print in a terminal.
+52  
+53      Message text comes from other people. Printed raw, a newline would let
+54      a sender fake a whole extra line ("[12:00] bob: ...") and escape codes
+55      (ESC [ ...) could clear the screen or recolour text. So invisible control
+56      and formatting characters are shown as visible escapes like \\n or \\x1b.
+57      Ordinary text in any language, including emoji, is left alone.
+58      """
+59      out = []
+60      for ch in str(text):
+61          if ch in "‌‍":  # zero-width (non-)joiners: needed by emoji sequences and some scripts
+62              out.append(ch)
+63          elif unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp", "Cs"):
+64              out.append(_ESCAPES.get(ch) or (f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}"))
+65          else:
+66              out.append(ch)
+67      return "".join(out)
 ```
 
-- **46** — How to show the three most common control characters.
-- **49** — `safe_display` makes text received from other people safe to print.
-- **50–57** — Docstring: a raw newline could fake a whole chat line, and escape codes (`ESC [ …`) could clear or recolour the screen.
-- **58** — Build the output piece by piece.
-- **59** — Look at every character.
-- **60–61** — Keep the zero-width joiner and non-joiner (invisible in this source line). Emoji sequences and some writing systems need them, and they cannot move the cursor.
-- **62** — Unicode categories `Cc` (control characters such as newline and ESC), `Cf` (invisible formatting, including right-to-left overrides that can reverse how text appears), `Zl`/`Zp` (line and paragraph separators) and `Cs` (broken surrogate halves)…
-- **63** — …are replaced by a visible escape: `\n`, `\r`, `\t`, `\x1b`, or `\uXXXX`.
-- **64–65** — Every other character (letters in any language, digits, emoji, punctuation) is kept.
-- **66** — Join and return.
+- **47** — How to show the three most common control characters.
+- **50** — `safe_display` makes text received from other people safe to print.
+- **51–58** — Docstring: a raw newline could fake a whole chat line, and escape codes (`ESC [ …`) could clear or recolour the screen.
+- **59** — Build the output piece by piece.
+- **60** — Look at every character.
+- **61–62** — Keep the zero-width joiner and non-joiner (invisible in this source line). Emoji sequences and some writing systems need them, and they cannot move the cursor.
+- **63** — Unicode categories `Cc` (control characters such as newline and ESC), `Cf` (invisible formatting, including right-to-left overrides that can reverse how text appears), `Zl`/`Zp` (line and paragraph separators) and `Cs` (broken surrogate halves)…
+- **64** — …are replaced by a visible escape: `\n`, `\r`, `\t`, `\x1b`, or `\uXXXX`.
+- **65–66** — Every other character (letters in any language, digits, emoji, punctuation) is kept.
+- **67** — Join and return.
 
 ### `ChatClient`: setup and local files
 
-[`client/session.py` lines 69–80](../client/session.py#L69-L80)
+[`client/session.py` lines 70–81](../client/session.py#L70-L81)
 
 ```python
-69  class ChatClient:
-70      def __init__(self, host: str, port: int, data_dir: str = "client_data", trace=_no_trace, notice=_stderr_notice,
-71                   ca_file: str = DEFAULT_CA_FILE):
-72          self.host, self.port = host, port
-73          self.data_dir = data_dir
-74          self.trace = trace
-75          self.notice = notice
-76          self.conn = Connection(host, port, ca_file)
-77          self.username: str | None = None
-78          self.keys: UserKeys | None = None
-79          self.seen_ids: set[str] = set()
-80          self.file_lock = threading.Lock()  # chat mode writes files from two threads
+70  class ChatClient:
+71      def __init__(self, host: str, port: int, data_dir: str = "client_data", trace=_no_trace, notice=_stderr_notice,
+72                   ca_file: str = DEFAULT_CA_FILE):
+73          self.host, self.port = host, port
+74          self.data_dir = data_dir
+75          self.trace = trace
+76          self.notice = notice
+77          self.conn = Connection(host, port, ca_file)
+78          self.username: str | None = None
+79          self.keys: UserKeys | None = None
+80          self.seen_ids: set[str] = set()
+81          self.file_lock = threading.Lock()  # chat mode writes files from two threads
 ```
 
-- **69** — `ChatClient` is everything one user's client does.
-- **70–71** — The constructor: server address, data folder, trace printer, notice printer, CA file.
-- **72–75** — Store the settings.
-- **76** — Open the TLS connection right away (section 4.1).
-- **77** — Not logged in.
-- **78** — No keys loaded.
-- **79** — The set of accepted message IDs.
-- **80** — A lock for local files, because chat mode writes them from two threads.
+- **70** — `ChatClient` is everything one user's client does.
+- **71–72** — The constructor: server address, data folder, trace printer, notice printer, CA file.
+- **73–76** — Store the settings.
+- **77** — Open the TLS connection right away (section 4.1).
+- **78** — Not logged in.
+- **79** — No keys loaded.
+- **80** — The set of accepted message IDs.
+- **81** — A lock for local files, because chat mode writes them from two threads.
 
-[`client/session.py` lines 82–106](../client/session.py#L82-L106)
+[`client/session.py` lines 83–107](../client/session.py#L83-L107)
 
 ```python
- 82      # ------------------------------------------------------------ files
- 83  
- 84      def _path(self, username: str, name: str) -> str:
- 85          return os.path.join(self.data_dir, username, name)
- 86  
- 87      def _read_json(self, username, name, default, expect_type):
- 88          """Read a local JSON file. A damaged file is moved aside (not deleted) and
- 89          `default` is used, so one bad file cannot lock you out of chatting."""
- 90          path = self._path(username, name)
- 91          if not os.path.exists(path):
- 92              return default
- 93          try:
- 94              with open(path, "r", encoding="utf-8") as f:
- 95                  data = json.load(f)
- 96              if not isinstance(data, expect_type):
- 97                  raise ValueError("unexpected content")
- 98              return data
- 99          except (OSError, ValueError) as exc:
-100              backup = f"{path}.damaged-{int(time.time())}"
-101              try:
-102                  os.replace(path, backup)
-103              except OSError:
-104                  backup = "(could not move it)"
-105              self.notice(f"{name} was damaged ({exc.__class__.__name__}); starting a fresh one. Old copy: {backup}")
-106              return default
+ 83      # ------------------------------------------------------------ files
+ 84  
+ 85      def _path(self, username: str, name: str) -> str:
+ 86          return os.path.join(self.data_dir, username, name)
+ 87  
+ 88      def _read_json(self, username, name, default, expect_type):
+ 89          """Read a local JSON file. A damaged file is moved aside (not deleted) and
+ 90          `default` is used, so one bad file cannot lock you out of chatting."""
+ 91          path = self._path(username, name)
+ 92          if not os.path.exists(path):
+ 93              return default
+ 94          try:
+ 95              with open(path, "r", encoding="utf-8") as f:
+ 96                  data = json.load(f)
+ 97              if not isinstance(data, expect_type):
+ 98                  raise ValueError("unexpected content")
+ 99              return data
+100          except (OSError, ValueError) as exc:
+101              backup = f"{path}.damaged-{int(time.time())}"
+102              try:
+103                  os.replace(path, backup)
+104              except OSError:
+105                  backup = "(could not move it)"
+106              self.notice(f"{name} was damaged ({exc.__class__.__name__}); starting a fresh one. Old copy: {backup}")
+107              return default
 ```
 
-- **82** — Section comment.
-- **84–85** — `_path` builds `data_dir/<username>/<file>`.
-- **87–89** — `_read_json` reads a local JSON file; a damaged one is moved aside, not deleted.
-- **90** — Work out the path.
-- **91–92** — No file yet → the default (empty list or dict).
-- **93–95** — Open and parse.
-- **96–97** — It must have the expected type (list or dict).
-- **98** — Return it.
-- **99** — On a read or parse error…
-- **100** — …name a backup with the current time…
-- **101–104** — …and rename the damaged file to it (if even that fails, say so).
-- **105** — Tell the user what happened.
-- **106** — Carry on with the default.
+- **83** — Section comment.
+- **85–86** — `_path` builds `data_dir/<username>/<file>`.
+- **88–90** — `_read_json` reads a local JSON file; a damaged one is moved aside, not deleted.
+- **91** — Work out the path.
+- **92–93** — No file yet → the default (empty list or dict).
+- **94–96** — Open and parse.
+- **97–98** — It must have the expected type (list or dict).
+- **99** — Return it.
+- **100** — On a read or parse error…
+- **101** — …name a backup with the current time…
+- **102–105** — …and rename the damaged file to it (if even that fails, say so).
+- **106** — Tell the user what happened.
+- **107** — Carry on with the default.
 
-[`client/session.py` lines 108–123](../client/session.py#L108-L123)
+[`client/session.py` lines 109–124](../client/session.py#L109-L124)
 
 ```python
-108      def _write_json(self, username, name, data):
-109          """Write to a temporary file, then rename over the old one, so a crash or a
-110          second thread never leaves a half-written file."""
-111          path = self._path(username, name)
-112          with self.file_lock:
-113              os.makedirs(os.path.dirname(path), exist_ok=True)
-114              tmp = f"{path}.tmp-{threading.get_ident()}"
-115              with open(tmp, "w", encoding="utf-8") as f:
-116                  json.dump(data, f, indent=2)
-117              os.replace(tmp, path)
-118  
-119      def _request(self, payload: dict) -> dict:
-120          resp = self.conn.request(payload)
-121          if not resp["ok"]:
-122              raise ClientError(str(resp.get("error", "The server refused the request."))[:300])
-123          return resp
+109      def _write_json(self, username, name, data):
+110          """Write to a temporary file, then rename over the old one, so a crash or a
+111          second thread never leaves a half-written file."""
+112          path = self._path(username, name)
+113          with self.file_lock:
+114              os.makedirs(os.path.dirname(path), exist_ok=True)
+115              tmp = f"{path}.tmp-{threading.get_ident()}"
+116              with open(tmp, "w", encoding="utf-8") as f:
+117                  json.dump(data, f, indent=2)
+118              os.replace(tmp, path)
+119  
+120      def _request(self, payload: dict) -> dict:
+121          resp = self.conn.request(payload)
+122          if not resp["ok"]:
+123              raise ClientError(str(resp.get("error", "The server refused the request."))[:300])
+124          return resp
 ```
 
-- **108–110** — `_write_json` writes a file safely.
-- **111** — Work out the path.
-- **112** — Take the file lock.
-- **113** — Create the folder if needed.
-- **114** — A temporary name that includes the thread ID, so two threads never share one.
-- **115–116** — Write the JSON.
-- **117** — Atomically rename over the real file: readers see the old version or the new one, never half of one.
-- **119** — `_request` sends a request and turns an error reply into `ClientError`.
-- **120** — Send through the connection.
-- **121–122** — If `ok` is false, raise `ClientError` with the server's message (cut to 300 characters).
-- **123** — Otherwise return the reply.
+- **109–111** — `_write_json` writes a file safely.
+- **112** — Work out the path.
+- **113** — Take the file lock.
+- **114** — Create the folder if needed.
+- **115** — A temporary name that includes the thread ID, so two threads never share one.
+- **116–117** — Write the JSON.
+- **118** — Atomically rename over the real file: readers see the old version or the new one, never half of one.
+- **120** — `_request` sends a request and turns an error reply into `ClientError`.
+- **121** — Send through the connection.
+- **122–123** — If `ok` is false, raise `ClientError` with the server's message (cut to 300 characters).
+- **124** — Otherwise return the reply.
 
 ### Sign up
 
-[`client/session.py` lines 125–147](../client/session.py#L125-L147)
+[`client/session.py` lines 126–151](../client/session.py#L126-L151)
 
 ```python
-125      # ------------------------------------------------------------ accounts
-126  
-127      def signup(self, username: str, password: str) -> None:
-128          if not isinstance(username, str) or not USERNAME_RE.fullmatch(username):
-129              raise ClientError("Username must be 3-20 characters using only a-z, 0-9 and _ (lowercase).")
-130          if not MIN_PASSWORD_LEN <= len(password) <= MAX_PASSWORD_LEN:
-131              raise ClientError(f"Password must be {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} characters.")
-132          if os.path.exists(self._path(username, "keys.json")):
-133              raise ClientError(f"A key file for '{username}' already exists in {self.data_dir}. Use login instead.")
-134          self.trace("KEYGEN", "generating RSA-3072 (encryption) and Ed25519 (signing) key pairs locally")
-135          keys = UserKeys.generate()
-136          login_hash = self._hash_password(username, password)
-137          self._request({
-138              "action": "signup",
-139              "username": username,
-140              "password_hash": login_hash,
-141              "enc_public_pem": keys.enc_public_pem(),
-142              "sign_public_pem": keys.sign_public_pem(),
-143          })
-144          # Only after the server accepted the name do we write the key file.
-145          self._write_json(username, "keys.json", keys.to_encrypted_file(password))
-146          self.trace("PROTECT KEYS", f"private keys saved encrypted (scrypt + AES-256-GCM) in {self._path(username, 'keys.json')}")
-147          self._start_session(username, keys)
+126      # ------------------------------------------------------------ accounts
+127  
+128      def signup(self, username: str, password: str, consent_version: str | None = None) -> None:
+129          """`consent_version` is the privacy-notice version the person accepted. The shell
+130          shows the notice and asks; tests and the demo accept it by passing nothing."""
+131          if not isinstance(username, str) or not USERNAME_RE.fullmatch(username):
+132              raise ClientError("Username must be 3-20 characters using only a-z, 0-9 and _ (lowercase).")
+133          if not MIN_PASSWORD_LEN <= len(password) <= MAX_PASSWORD_LEN:
+134              raise ClientError(f"Password must be {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} characters.")
+135          if os.path.exists(self._path(username, "keys.json")):
+136              raise ClientError(f"A key file for '{username}' already exists in {self.data_dir}. Use login instead.")
+137          self.trace("KEYGEN", "generating RSA-3072 (encryption) and Ed25519 (signing) key pairs locally")
+138          keys = UserKeys.generate()
+139          login_hash = self._hash_password(username, password)
+140          self._request({
+141              "action": "signup",
+142              "username": username,
+143              "password_hash": login_hash,
+144              "enc_public_pem": keys.enc_public_pem(),
+145              "sign_public_pem": keys.sign_public_pem(),
+146              "consent_version": consent_version or self.privacy_notice()["version"],
+147          })
+148          # Only after the server accepted the name do we write the key file.
+149          self._write_json(username, "keys.json", keys.to_encrypted_file(password))
+150          self.trace("PROTECT KEYS", f"private keys saved encrypted (scrypt + AES-256-GCM) in {self._path(username, 'keys.json')}")
+151          self._start_session(username, keys)
 ```
 
-- **125** — Section comment.
-- **127** — `signup`.
-- **128–129** — Check the username pattern first: instant feedback, before any slow key generation. `fullmatch` means the whole name must match, so a name with a trailing newline is refused.
-- **130–131** — Check the password length (only the client can).
-- **132–133** — If this folder already holds keys for this name, refuse rather than overwrite them.
-- **134** — Trace.
-- **135** — Generate both key pairs locally (RSA-3072 takes about half a second).
-- **136** — Compute the login hash (≈0.1 s).
-- **137–143** — Send the signup request: name, login hash, and the two **public** keys.
-- **144** — Comment.
-- **145** — Only now write `keys.json`, the private keys encrypted under `scrypt(password, new random salt)` (section 2.3). If the server had refused (name taken), no key file would be left behind.
-- **146** — Trace.
-- **147** — Start the session.
+- **126** — Section comment.
+- **128** — `signup`. The optional `consent_version` is the privacy-notice version the person accepted.
+- **129–130** — Docstring: the shell shows the notice and asks; tests and the demo accept it by passing nothing.
+- **131–132** — Check the username pattern first: instant feedback, before any slow key generation. `fullmatch` means the whole name must match, so a name with a trailing newline is refused.
+- **133–134** — Check the password length (only the client can).
+- **135–136** — If this folder already holds keys for this name, refuse rather than overwrite them.
+- **137** — Trace.
+- **138** — Generate both key pairs locally (RSA-3072 takes about half a second).
+- **139** — Compute the login hash (≈0.1 s).
+- **140–145** — Send the signup request: name, login hash, and the two **public** keys…
+- **146–147** — …plus the accepted privacy-notice version. If none was given, the current version is fetched from the server and used (programmatic acceptance, for tests and the demo).
+- **148** — Comment.
+- **149** — Only now write `keys.json`, the private keys encrypted under `scrypt(password, new random salt)` (section 2.3). If the server had refused (name taken), no key file would be left behind.
+- **150** — Trace.
+- **151** — Start the session.
 
-[`client/session.py` lines 149–154](../client/session.py#L149-L154)
+[`client/session.py` lines 153–158](../client/session.py#L153-L158)
 
 ```python
-149      def _hash_password(self, username: str, password: str) -> str:
-150          login_hash = client_password_hash(username, password)
-151          self.trace("HASH PASSWORD",
-152                     f"scrypt(password, salt = SHA-256(username)) -> {login_hash[:16]}...\n"
-153                     "only this hash is sent; the password itself never leaves this computer")
-154          return login_hash
+153      def _hash_password(self, username: str, password: str) -> str:
+154          login_hash = client_password_hash(username, password)
+155          self.trace("HASH PASSWORD",
+156                     f"scrypt(password, salt = SHA-256(username)) -> {login_hash[:16]}...\n"
+157                     "only this hash is sent; the password itself never leaves this computer")
+158          return login_hash
 ```
 
-- **149** — `_hash_password` wraps the login-hash function.
-- **150** — Compute `scrypt(password, salt from username)`.
-- **151–153** — Trace: shows only the first 16 characters of the hash.
-- **154** — Return it.
+- **153** — `_hash_password` wraps the login-hash function.
+- **154** — Compute `scrypt(password, salt from username)`.
+- **155–157** — Trace: shows only the first 16 characters of the hash.
+- **158** — Return it.
 
 ### Log in
 
-[`client/session.py` lines 156–178](../client/session.py#L156-L178)
+[`client/session.py` lines 160–182](../client/session.py#L160-L182)
 
 ```python
-156      def login(self, username: str, password: str) -> None:
-157          # A name that cannot exist is refused here, without contacting the
-158          # server, so text typed into the wrong box is not sent anywhere.
-159          if not isinstance(username, str) or not USERNAME_RE.fullmatch(username) or len(password) > MAX_PASSWORD_LEN:
-160              raise ClientError("Invalid username or password.")
-161          self._request({"action": "login", "username": username,
-162                         "password_hash": self._hash_password(username, password)})
-163          # The server said yes, so `username` is a real, validated name: safe to use in a path.
-164          path = self._path(username, "keys.json")
-165          if not os.path.exists(path):
-166              self.conn.request({"action": "logout"})
-167              raise ClientError(f"No key file for '{username}' in {self.data_dir}; this device cannot read their messages.")
-168          try:
-169              with open(path, "r", encoding="utf-8") as f:
-170                  keys = UserKeys.from_encrypted_file(json.load(f), password)
-171          except KeyFileError as exc:
-172              self.conn.request({"action": "logout"})
-173              raise ClientError(str(exc)) from None
-174          except (OSError, ValueError, KeyError, TypeError) as exc:
-175              self.conn.request({"action": "logout"})
-176              raise ClientError(f"The key file {path} is damaged ({exc.__class__.__name__}). "
-177                                "Restore it from a backup; without it this account's messages cannot be read.") from None
-178          self._start_session(username, keys)
+160      def login(self, username: str, password: str) -> None:
+161          # A name that cannot exist is refused here, without contacting the
+162          # server, so text typed into the wrong box is not sent anywhere.
+163          if not isinstance(username, str) or not USERNAME_RE.fullmatch(username) or len(password) > MAX_PASSWORD_LEN:
+164              raise ClientError("Invalid username or password.")
+165          self._request({"action": "login", "username": username,
+166                         "password_hash": self._hash_password(username, password)})
+167          # The server said yes, so `username` is a real, validated name: safe to use in a path.
+168          path = self._path(username, "keys.json")
+169          if not os.path.exists(path):
+170              self.conn.request({"action": "logout"})
+171              raise ClientError(f"No key file for '{username}' in {self.data_dir}; this device cannot read their messages.")
+172          try:
+173              with open(path, "r", encoding="utf-8") as f:
+174                  keys = UserKeys.from_encrypted_file(json.load(f), password)
+175          except KeyFileError as exc:
+176              self.conn.request({"action": "logout"})
+177              raise ClientError(str(exc)) from None
+178          except (OSError, ValueError, KeyError, TypeError) as exc:
+179              self.conn.request({"action": "logout"})
+180              raise ClientError(f"The key file {path} is damaged ({exc.__class__.__name__}). "
+181                                "Restore it from a backup; without it this account's messages cannot be read.") from None
+182          self._start_session(username, keys)
 ```
 
-- **156** — `login`.
-- **157–158** — Comment.
-- **159–160** — A name that doesn't fully match the pattern (or an absurd password) is refused locally with the same generic message the server uses. Nothing is sent.
-- **161–162** — Send the name and the login hash. A wrong password raises `ClientError` here with the server's generic message.
-- **163** — Comment: the server accepted the name, so it is a valid name and safe to use in a file path.
-- **164** — Path of the key file.
-- **165–167** — No key file on this device: log out again and explain. (Keys exist only on the device where the account was created.)
-- **168–170** — Open the file and decrypt the private keys with the password.
-- **171–173** — Wrong password for the file or edited file (`KeyFileError`): log out and pass the message on.
-- **174–177** — Unreadable or malformed file: log out and say which file is damaged.
-- **178** — Success: start the session.
+- **160** — `login`.
+- **161–162** — Comment.
+- **163–164** — A name that doesn't fully match the pattern (or an absurd password) is refused locally with the same generic message the server uses. Nothing is sent.
+- **165–166** — Send the name and the login hash. A wrong password raises `ClientError` here with the server's generic message.
+- **167** — Comment: the server accepted the name, so it is a valid name and safe to use in a file path.
+- **168** — Path of the key file.
+- **169–171** — No key file on this device: log out again and explain. (Keys exist only on the device where the account was created.)
+- **172–174** — Open the file and decrypt the private keys with the password.
+- **175–177** — Wrong password for the file or edited file (`KeyFileError`): log out and pass the message on.
+- **178–181** — Unreadable or malformed file: log out and say which file is damaged.
+- **182** — Success: start the session.
 
-[`client/session.py` lines 180–194](../client/session.py#L180-L194)
+[`client/session.py` lines 184–198](../client/session.py#L184-L198)
 
 ```python
-180      def _start_session(self, username, keys):
-181          self.username, self.keys = username, keys
-182          ids = self._read_json(username, "seen_ids.json", [], list)
-183          self.seen_ids = {i for i in ids if isinstance(i, str)}
-184  
-185      def logout(self) -> None:
-186          self.conn.request({"action": "logout"})
-187          self.username, self.keys, self.seen_ids = None, None, set()
+184      def _start_session(self, username, keys):
+185          self.username, self.keys = username, keys
+186          ids = self._read_json(username, "seen_ids.json", [], list)
+187          self.seen_ids = {i for i in ids if isinstance(i, str)}
 188  
-189      def close(self) -> None:
-190          self.conn.close()
-191  
-192      def _require_login(self):
-193          if self.username is None:
-194              raise ClientError("Please log in first.")
+189      def logout(self) -> None:
+190          self.conn.request({"action": "logout"})
+191          self.username, self.keys, self.seen_ids = None, None, set()
+192  
+193      def close(self) -> None:
+194          self.conn.close()
+195  
+196      def _require_login(self):
+197          if self.username is None:
+198              raise ClientError("Please log in first.")
 ```
 
-- **180–181** — `_start_session` remembers who is logged in and their keys.
-- **182** — Load the accepted message IDs (empty list if none).
-- **183** — Keep only string entries, as a set.
-- **185–187** — `logout`: tell the server, and forget the user, keys and IDs on this side.
-- **189–190** — `close` closes the connection.
-- **192–194** — `_require_login` raises `ClientError` if nobody is logged in.
+- **184–185** — `_start_session` remembers who is logged in and their keys.
+- **186** — Load the accepted message IDs (empty list if none).
+- **187** — Keep only string entries, as a set.
+- **189–191** — `logout`: tell the server, and forget the user, keys and IDs on this side.
+- **193–194** — `close` closes the connection.
+- **196–198** — `_require_login` raises `ClientError` if nobody is logged in.
 
 ### The directory and key pinning
 
-[`client/session.py` lines 196–232](../client/session.py#L196-L232)
+[`client/session.py` lines 200–236](../client/session.py#L200-L236)
 
 ```python
-196      # ------------------------------------------------------------ directory
-197  
-198      def users(self, include_self: bool = False) -> list[dict]:
-199          """Fetch users and public keys, pinning each user's keys the first time we see them.
-200  
-201          If the server later hands out DIFFERENT keys for a known user, that
-202          could be the server trying to impersonate them, so we refuse.
-203          """
-204          self._require_login()
-205          resp = self._request({"action": "users", "include_self": include_self})
-206          listing = resp.get("users")
-207          if not isinstance(listing, list):
-208              raise ClientError("The server sent an invalid user list.")
-209          with self.file_lock:
-210              known = self._read_json(self.username, "known_keys.json", {}, dict)
-211          changed = False
-212          out = []
-213          for u in listing:
-214              # Ignore anything that is not a well-formed entry rather than crash on it.
-215              if not isinstance(u, dict) or not all(isinstance(u.get(k), str)
-216                                                    for k in ("username", "enc_public_pem", "sign_public_pem")):
-217                  continue
-218              u = {k: u[k] for k in ("username", "enc_public_pem", "sign_public_pem")}
-219              u["fingerprint"] = fingerprint(u["enc_public_pem"], u["sign_public_pem"])
-220              pinned = known.get(u["username"])
-221              if not isinstance(pinned, dict):
-222                  known[u["username"]] = {"enc_public_pem": u["enc_public_pem"], "sign_public_pem": u["sign_public_pem"]}
-223                  changed = True
-224                  u["key_status"] = "new (pinned now)"
-225              elif pinned.get("enc_public_pem") != u["enc_public_pem"] or pinned.get("sign_public_pem") != u["sign_public_pem"]:
-226                  u["key_status"] = "CHANGED - not trusted"
-227              else:
-228                  u["key_status"] = "matches pinned key"
-229              out.append(u)
-230          if changed:
-231              self._write_json(self.username, "known_keys.json", known)
-232          return out
+200      # ------------------------------------------------------------ directory
+201  
+202      def users(self, include_self: bool = False) -> list[dict]:
+203          """Fetch users and public keys, pinning each user's keys the first time we see them.
+204  
+205          If the server later hands out DIFFERENT keys for a known user, that
+206          could be the server trying to impersonate them, so we refuse.
+207          """
+208          self._require_login()
+209          resp = self._request({"action": "users", "include_self": include_self})
+210          listing = resp.get("users")
+211          if not isinstance(listing, list):
+212              raise ClientError("The server sent an invalid user list.")
+213          with self.file_lock:
+214              known = self._read_json(self.username, "known_keys.json", {}, dict)
+215          changed = False
+216          out = []
+217          for u in listing:
+218              # Ignore anything that is not a well-formed entry rather than crash on it.
+219              if not isinstance(u, dict) or not all(isinstance(u.get(k), str)
+220                                                    for k in ("username", "enc_public_pem", "sign_public_pem")):
+221                  continue
+222              u = {k: u[k] for k in ("username", "enc_public_pem", "sign_public_pem")}
+223              u["fingerprint"] = fingerprint(u["enc_public_pem"], u["sign_public_pem"])
+224              pinned = known.get(u["username"])
+225              if not isinstance(pinned, dict):
+226                  known[u["username"]] = {"enc_public_pem": u["enc_public_pem"], "sign_public_pem": u["sign_public_pem"]}
+227                  changed = True
+228                  u["key_status"] = "new (pinned now)"
+229              elif pinned.get("enc_public_pem") != u["enc_public_pem"] or pinned.get("sign_public_pem") != u["sign_public_pem"]:
+230                  u["key_status"] = "CHANGED - not trusted"
+231              else:
+232                  u["key_status"] = "matches pinned key"
+233              out.append(u)
+234          if changed:
+235              self._write_json(self.username, "known_keys.json", known)
+236          return out
 ```
 
-- **196** — Section comment.
-- **198** — `users` fetches the directory and applies pinning.
-- **199–203** — Docstring.
-- **204** — Must be logged in.
-- **205** — Ask the server.
-- **206–208** — The reply must contain a list.
-- **209–210** — Load the pinned keys (under the file lock).
-- **211–212** — Track whether anything new was pinned; collect results.
-- **213** — For each user the server listed…
-- **214–217** — …skip anything malformed instead of crashing.
-- **218** — Keep only the three expected fields.
-- **219** — Compute the fingerprint (section 2.3).
-- **220** — Look up the pinned keys for this name.
-- **221–224** — Never seen before: pin these keys now, and mark the entry "new (pinned now)".
-- **225–226** — Seen before, but the keys differ: mark "CHANGED - not trusted". This is what catches a server trying to substitute keys.
-- **227–228** — Same as pinned: "matches pinned key".
-- **229** — Add to the results.
-- **230–231** — Save the pinned keys if any were added.
-- **232** — Return the list.
+- **200** — Section comment.
+- **202** — `users` fetches the directory and applies pinning.
+- **203–207** — Docstring.
+- **208** — Must be logged in.
+- **209** — Ask the server.
+- **210–212** — The reply must contain a list.
+- **213–214** — Load the pinned keys (under the file lock).
+- **215–216** — Track whether anything new was pinned; collect results.
+- **217** — For each user the server listed…
+- **218–221** — …skip anything malformed instead of crashing.
+- **222** — Keep only the three expected fields.
+- **223** — Compute the fingerprint (section 2.3).
+- **224** — Look up the pinned keys for this name.
+- **225–228** — Never seen before: pin these keys now, and mark the entry "new (pinned now)".
+- **229–230** — Seen before, but the keys differ: mark "CHANGED - not trusted". This is what catches a server trying to substitute keys.
+- **231–232** — Same as pinned: "matches pinned key".
+- **233** — Add to the results.
+- **234–235** — Save the pinned keys if any were added.
+- **236** — Return the list.
 
-[`client/session.py` lines 234–244](../client/session.py#L234-L244)
+[`client/session.py` lines 238–248](../client/session.py#L238-L248)
 
 ```python
-234      def _trusted_keys(self, username: str) -> dict:
-235          """Public keys for `username`, but only if they match the pinned copy."""
-236          for u in self.users(include_self=True):
-237              if u["username"] == username:
-238                  if u["key_status"].startswith("CHANGED"):
-239                      raise ClientError(
-240                          f"WARNING: the server now reports different keys for '{username}'. "
-241                          "Refusing to use them. Verify the fingerprint with them in person."
-242                      )
-243                  return u
-244          raise ClientError(f"Unknown user '{safe_display(username)[:40]}'.")
+238      def _trusted_keys(self, username: str) -> dict:
+239          """Public keys for `username`, but only if they match the pinned copy."""
+240          for u in self.users(include_self=True):
+241              if u["username"] == username:
+242                  if u["key_status"].startswith("CHANGED"):
+243                      raise ClientError(
+244                          f"WARNING: the server now reports different keys for '{username}'. "
+245                          "Refusing to use them. Verify the fingerprint with them in person."
+246                      )
+247                  return u
+248          raise ClientError(f"Unknown user '{safe_display(username)[:40]}'.")
 ```
 
-- **234–235** — `_trusted_keys` returns a user's keys only if they are trustworthy.
-- **236** — Fetch the full directory, including ourselves.
-- **237** — Find the requested user.
-- **238–242** — Keys changed: refuse to use them, with a warning to compare fingerprints in person.
-- **243** — Otherwise return the entry.
-- **244** — No such user. The name is passed through `safe_display` and shortened, since it may come from a received package.
+- **238–239** — `_trusted_keys` returns a user's keys only if they are trustworthy.
+- **240** — Fetch the full directory, including ourselves.
+- **241** — Find the requested user.
+- **242–246** — Keys changed: refuse to use them, with a warning to compare fingerprints in person.
+- **247** — Otherwise return the entry.
+- **248** — No such user. The name is passed through `safe_display` and shortened, since it may come from a received package.
 
 ### Sending
 
-[`client/session.py` lines 246–268](../client/session.py#L246-L268)
+[`client/session.py` lines 250–272](../client/session.py#L250-L272)
 
 ```python
-246      # ------------------------------------------------------------ messages
-247  
-248      def build_package(self, recipient: str, text: str) -> dict:
-249          """Encrypt and sign, but do not send (lets demos inspect or tamper with the package)."""
-250          self._require_login()
-251          if recipient == self.username:
-252              raise ClientError("You cannot send a message to yourself.")
-253          if len(text) > MAX_MESSAGE_CHARS:
-254              raise ClientError(f"Message too long ({len(text)} characters; the limit is {MAX_MESSAGE_CHARS}).")
-255          r = self._trusted_keys(recipient)
-256          self.trace("READ", f"plaintext from {self.username} to {recipient}: {text!r}")
-257          try:
-258              return encrypt_and_sign(text, self.username, recipient, self.keys, r["enc_public_pem"], trace=self.trace)
-259          except ValueError:
-260              raise ClientError(f"'{recipient}' has an unusable public key; cannot encrypt to them.") from None
-261  
-262      def send_package(self, package: dict) -> str:
-263          self._require_login()
-264          self.trace("TRANSMIT", f"sending package {package['msg_id']} to the server over the socket")
-265          return self._request({"action": "send", "package": package})["msg_id"]
-266  
-267      def send(self, recipient: str, text: str) -> str:
-268          return self.send_package(self.build_package(recipient, text))
+250      # ------------------------------------------------------------ messages
+251  
+252      def build_package(self, recipient: str, text: str) -> dict:
+253          """Encrypt and sign, but do not send (lets demos inspect or tamper with the package)."""
+254          self._require_login()
+255          if recipient == self.username:
+256              raise ClientError("You cannot send a message to yourself.")
+257          if len(text) > MAX_MESSAGE_CHARS:
+258              raise ClientError(f"Message too long ({len(text)} characters; the limit is {MAX_MESSAGE_CHARS}).")
+259          r = self._trusted_keys(recipient)
+260          self.trace("READ", f"plaintext from {self.username} to {recipient}: {text!r}")
+261          try:
+262              return encrypt_and_sign(text, self.username, recipient, self.keys, r["enc_public_pem"], trace=self.trace)
+263          except ValueError:
+264              raise ClientError(f"'{recipient}' has an unusable public key; cannot encrypt to them.") from None
+265  
+266      def send_package(self, package: dict) -> str:
+267          self._require_login()
+268          self.trace("TRANSMIT", f"sending package {package['msg_id']} to the server over the socket")
+269          return self._request({"action": "send", "package": package})["msg_id"]
+270  
+271      def send(self, recipient: str, text: str) -> str:
+272          return self.send_package(self.build_package(recipient, text))
 ```
 
-- **246** — Section comment.
-- **248–249** — `build_package` encrypts and signs without sending (the demo uses this to tamper with a package).
-- **250** — Must be logged in.
-- **251–252** — No messages to yourself.
-- **253–254** — Enforce the length limit before encrypting.
-- **255** — Get the recipient's keys, pinned and checked.
-- **256** — Trace (prints the plaintext; only in verbose mode, only on your own screen).
-- **257–258** — Encrypt and sign (section 2.4) with the recipient's RSA public key.
-- **259–260** — If their key cannot be used, a clear error.
-- **262** — `send_package` sends a finished package.
-- **263** — Must be logged in.
-- **264** — Trace.
-- **265** — Send it; return the message ID the server accepted.
-- **267–268** — `send` builds and sends in one call.
+- **250** — Section comment.
+- **252–253** — `build_package` encrypts and signs without sending (the demo uses this to tamper with a package).
+- **254** — Must be logged in.
+- **255–256** — No messages to yourself.
+- **257–258** — Enforce the length limit before encrypting.
+- **259** — Get the recipient's keys, pinned and checked.
+- **260** — Trace (prints the plaintext; only in verbose mode, only on your own screen).
+- **261–262** — Encrypt and sign (section 2.4) with the recipient's RSA public key.
+- **263–264** — If their key cannot be used, a clear error.
+- **266** — `send_package` sends a finished package.
+- **267** — Must be logged in.
+- **268** — Trace.
+- **269** — Send it; return the message ID the server accepted.
+- **271–272** — `send` builds and sends in one call.
 
 ### Receiving
 
-[`client/session.py` lines 270–276](../client/session.py#L270-L276)
+[`client/session.py` lines 274–280](../client/session.py#L274-L280)
 
 ```python
-270      def fetch_inbox(self) -> list:
-271          """Raw packages from the server (still encrypted)."""
-272          self._require_login()
-273          messages = self._request({"action": "inbox"}).get("messages")
-274          if not isinstance(messages, list):
-275              raise ClientError("The server sent an invalid inbox.")
-276          return messages
+274      def fetch_inbox(self) -> list:
+275          """Raw packages from the server (still encrypted)."""
+276          self._require_login()
+277          messages = self._request({"action": "inbox"}).get("messages")
+278          if not isinstance(messages, list):
+279              raise ClientError("The server sent an invalid inbox.")
+280          return messages
 ```
 
-- **270–271** — `fetch_inbox` gets the raw, still-encrypted packages.
-- **272** — Must be logged in.
-- **273** — Ask the server.
-- **274–275** — The reply must be a list.
-- **276** — Return it.
+- **274–275** — `fetch_inbox` gets the raw, still-encrypted packages.
+- **276** — Must be logged in.
+- **277** — Ask the server.
+- **278–279** — The reply must be a list.
+- **280** — Return it.
 
-[`client/session.py` lines 278–307](../client/session.py#L278-L307)
+[`client/session.py` lines 282–311](../client/session.py#L282-L311)
 
 ```python
-278      def open_package(self, package) -> dict:
-279          """Verify and decrypt one package. Never raises for a bad message;
-280          returns {"ok": False, "reason": ...} so one bad message cannot hide the rest."""
-281          is_dict = isinstance(package, dict)
-282          sender = package.get("sender") if is_dict else None
-283          sender = sender if isinstance(sender, str) else "?"
-284          ts = package.get("timestamp") if is_dict else None
-285          result = {"msg_id": package.get("msg_id") if is_dict else None,
-286                    "sender": sender, "timestamp": ts if type(ts) is int and 0 < ts < 2**40 else None}
-287          try:
-288              if not is_dict:
-289                  raise MessageRejected("malformed package (not an object)")
-290              sender_keys = self._trusted_keys(sender)
-291              self.trace("RECEIVE", f"package {safe_display(result['msg_id'])[:64]} claims to be from {sender}")
-292              text = verify_and_decrypt(
-293                  package, self.username, self.keys, sender_keys["sign_public_pem"],
-294                  seen_ids=self.seen_ids, trace=self.trace,
-295              )
-296          except (MessageRejected, ClientError) as exc:
-297              result.update(ok=False, reason=getattr(exc, "reason", str(exc)))
-298              return result
-299          except Exception as exc:  # last line of defence: never let one message crash the inbox
-300              result.update(ok=False, reason=f"unreadable package ({exc.__class__.__name__})")
-301              return result
-302          self._write_json(self.username, "seen_ids.json", sorted(self.seen_ids))
-303          result.update(ok=True, text=text)
-304          return result
-305  
-306      def inbox(self) -> list[dict]:
-307          return [self.open_package(p) for p in self.fetch_inbox()]
+282      def open_package(self, package) -> dict:
+283          """Verify and decrypt one package. Never raises for a bad message;
+284          returns {"ok": False, "reason": ...} so one bad message cannot hide the rest."""
+285          is_dict = isinstance(package, dict)
+286          sender = package.get("sender") if is_dict else None
+287          sender = sender if isinstance(sender, str) else "?"
+288          ts = package.get("timestamp") if is_dict else None
+289          result = {"msg_id": package.get("msg_id") if is_dict else None,
+290                    "sender": sender, "timestamp": ts if type(ts) is int and 0 < ts < 2**40 else None}
+291          try:
+292              if not is_dict:
+293                  raise MessageRejected("malformed package (not an object)")
+294              sender_keys = self._trusted_keys(sender)
+295              self.trace("RECEIVE", f"package {safe_display(result['msg_id'])[:64]} claims to be from {sender}")
+296              text = verify_and_decrypt(
+297                  package, self.username, self.keys, sender_keys["sign_public_pem"],
+298                  seen_ids=self.seen_ids, trace=self.trace,
+299              )
+300          except (MessageRejected, ClientError) as exc:
+301              result.update(ok=False, reason=getattr(exc, "reason", str(exc)))
+302              return result
+303          except Exception as exc:  # last line of defence: never let one message crash the inbox
+304              result.update(ok=False, reason=f"unreadable package ({exc.__class__.__name__})")
+305              return result
+306          self._write_json(self.username, "seen_ids.json", sorted(self.seen_ids))
+307          result.update(ok=True, text=text)
+308          return result
+309  
+310      def inbox(self) -> list[dict]:
+311          return [self.open_package(p) for p in self.fetch_inbox()]
 ```
 
-- **278–280** — `open_package` verifies and decrypts one package and never raises: one bad message must not hide the others.
-- **281** — Is it a dict at all?
-- **282–283** — The claimed sender, or `?` if missing or not text.
-- **284** — The timestamp, if any.
-- **285–286** — Start the result: message ID, sender, and the timestamp only if it is a sane integer (so the shell can show a time safely).
-- **287** — Try the checks…
-- **288–289** — Not an object: reject.
-- **290** — Get the claimed sender's **pinned** keys. An unknown sender or changed key raises `ClientError`, which rejects the message.
-- **291** — Trace for verbose mode. The message ID has not been validated yet at this point (that happens inside `verify_and_decrypt`), so it is passed through `safe_display` and cut to 64 characters before printing (part of the fix for finding V1).
-- **292–295** — Verify the signature, then check recipient, time and replay, then unwrap, then decrypt (section 2.4), using this user's seen-ID set.
-- **296–298** — Any `MessageRejected` or `ClientError`: mark the result not OK, with the reason.
-- **299–301** — Any other exception (a bug or something unforeseen): also reject, never crash.
-- **302** — Success: save the updated seen-ID list to disk, so a replay is caught even after restarting the client.
-- **303** — Add the text to the result.
-- **304** — Return it.
-- **306–307** — `inbox` fetches and opens every package.
+- **282–284** — `open_package` verifies and decrypts one package and never raises: one bad message must not hide the others.
+- **285** — Is it a dict at all?
+- **286–287** — The claimed sender, or `?` if missing or not text.
+- **288** — The timestamp, if any.
+- **289–290** — Start the result: message ID, sender, and the timestamp only if it is a sane integer (so the shell can show a time safely).
+- **291** — Try the checks…
+- **292–293** — Not an object: reject.
+- **294** — Get the claimed sender's **pinned** keys. An unknown sender or changed key raises `ClientError`, which rejects the message.
+- **295** — Trace for verbose mode. The message ID has not been validated yet at this point (that happens inside `verify_and_decrypt`), so it is passed through `safe_display` and cut to 64 characters before printing (part of the fix for finding V1).
+- **296–299** — Verify the signature, then check recipient, time and replay, then unwrap, then decrypt (section 2.4), using this user's seen-ID set.
+- **300–302** — Any `MessageRejected` or `ClientError`: mark the result not OK, with the reason.
+- **303–305** — Any other exception (a bug or something unforeseen): also reject, never crash.
+- **306** — Success: save the updated seen-ID list to disk, so a replay is caught even after restarting the client.
+- **307** — Add the text to the result.
+- **308** — Return it.
+- **310–311** — `inbox` fetches and opens every package.
+
+### Privacy rights
+
+[`client/session.py` lines 313–331](../client/session.py#L313-L331)
+
+```python
+313      # ------------------------------------------------------------ privacy rights
+314  
+315      def privacy_notice(self) -> dict:
+316          """The server's privacy notice: {"version": ..., "text": ...}. No login needed."""
+317          return self._request({"action": "privacy_notice"})
+318  
+319      def mydata(self) -> dict:
+320          """Everything the server stores about me (PDPA s.30 access, s.31 portability)."""
+321          self._require_login()
+322          return self._request({"action": "mydata"})["data"]
+323  
+324      def delete_account(self, password: str) -> None:
+325          """Erase my account on the server and my files on this device (PDPA s.33)."""
+326          self._require_login()
+327          self._request({"action": "delete_account",
+328                         "password_hash": self._hash_password(self.username, password)})
+329          # The server has erased the account; now remove keys, pins and seen IDs here too.
+330          shutil.rmtree(os.path.join(self.data_dir, self.username), ignore_errors=True)
+331          self.username, self.keys, self.seen_ids = None, None, set()
+```
+
+- **313** — Section comment.
+- **315–317** — `privacy_notice` asks the server for its notice text and version. No login is needed, because the notice must be shown before anything is collected.
+- **319–320** — `mydata` asks for everything the server stores about me (PDPA s.30 access, s.31 portability).
+- **321** — Must be logged in.
+- **322** — Return the `data` part of the reply (a dict the shell prints as JSON).
+- **324–325** — `delete_account` erases my account (PDPA s.33).
+- **326** — Must be logged in.
+- **327–328** — Send the request with my login hash, so the server can re-check the password before erasing anything. A wrong password raises `ClientError` here and nothing is deleted.
+- **329** — Comment.
+- **330** — The server has erased the account, so delete this device's folder too: the encrypted key file, the pinned keys and the seen-message IDs. Without this, personal data would stay on the computer after "deletion".
+- **331** — Forget the user, keys and IDs in memory.
 
 ## 4.3 `cli.py`
 
 ### Header
 
-[`client/cli.py` lines 1–25](../client/cli.py#L1-L25)
+[`client/cli.py` lines 1–28](../client/cli.py#L1-L28)
 
 ```python
  1  """Interactive command-line client.
@@ -747,436 +792,473 @@ three layers:
 10      send <recipient> <message> encrypt, sign and send one message
 11      inbox                      fetch, verify and decrypt new messages
 12      verbose on|off             print each crypto step as it happens
-13      logout
-14      quit
-15  """
-16  
-17  import argparse
-18  import cmd
-19  import datetime
-20  import getpass
-21  import sys
-22  import threading
-23  
-24  from .connection import DEFAULT_CA_FILE, ConnectionError_
-25  from .session import ChatClient, ClientError, safe_display
+13      mydata                     show everything the server stores about you
+14      delete_account             erase your account and data (asks to confirm)
+15      logout
+16      quit
+17  """
+18  
+19  import argparse
+20  import cmd
+21  import datetime
+22  import getpass
+23  import json
+24  import sys
+25  import threading
+26  
+27  from .connection import DEFAULT_CA_FILE, ConnectionError_
+28  from .session import ChatClient, ClientError, safe_display
 ```
 
-- **1–15** — Module docstring: how to run it and the list of commands.
-- **17** — `argparse` for options.
-- **18** — `cmd` is Python's standard framework for line-based command shells: it reads a line, finds `do_<command>`, and calls it.
-- **19** — `datetime` to show message times.
-- **20** — `getpass` reads passwords without echoing them to the screen.
-- **21** — `sys` to write directly to the terminal in chat mode.
-- **22** — `threading` for the chat listener.
-- **24** — The connection error and default CA path.
-- **25** — The client logic and `safe_display`.
+- **1–17** — Module docstring: how to run it and the list of commands.
+- **19** — `argparse` for options.
+- **20** — `cmd` is Python's standard framework for line-based command shells: it reads a line, finds `do_<command>`, and calls it.
+- **21** — `datetime` to show message times.
+- **22** — `getpass` reads passwords without echoing them to the screen.
+- **23** — `json` to print `mydata` in a readable, machine-readable form.
+- **24** — `sys` to write directly to the terminal in chat mode.
+- **25** — `threading` for the chat listener.
+- **27** — The connection error and default CA path.
+- **28** — The client logic and `safe_display`.
 
-[`client/cli.py` lines 28–35](../client/cli.py#L28-L35)
+[`client/cli.py` lines 31–38](../client/cli.py#L31-L38)
 
 ```python
-28  def print_step(step: str, detail: str = "") -> None:
-29      print(f"  [{step}]")
-30      for line in detail.splitlines():
-31          print(f"      {line}")
-32  
-33  
-34  def silent(step, detail=""):
-35      pass
+31  def print_step(step: str, detail: str = "") -> None:
+32      print(f"  [{step}]")
+33      for line in detail.splitlines():
+34          print(f"      {line}")
+35  
+36  
+37  def silent(step, detail=""):
+38      pass
 ```
 
-- **28–31** — `print_step` is the verbose-mode trace printer: the step name in brackets, then each detail line indented.
-- **34–35** — `silent` prints nothing (verbose off).
+- **31–34** — `print_step` is the verbose-mode trace printer: the step name in brackets, then each detail line indented.
+- **37–38** — `silent` prints nothing (verbose off).
 
 ### The shell
 
-[`client/cli.py` lines 38–57](../client/cli.py#L38-L57)
+[`client/cli.py` lines 41–60](../client/cli.py#L41-L60)
 
 ```python
-38  class ChatShell(cmd.Cmd):
-39      intro = (
-40          "Secure chat client.\n"
-41          "  New here?  signup <your name>      Returning?  login <your name>\n"
-42          "  Then:      users                   to see who you can talk to\n"
-43          "             chat <their name>       to start chatting\n"
-44          "Type 'help' for all commands."
-45      )
-46  
-47      def __init__(self, client: ChatClient):
-48          super().__init__()
-49          self.client = client
-50          self._update_prompt()
-51  
-52      def _update_prompt(self):
-53          self.prompt = f"({self.client.username or 'not logged in'}) > "
+41  class ChatShell(cmd.Cmd):
+42      intro = (
+43          "Secure chat client.\n"
+44          "  New here?  signup <your name>      Returning?  login <your name>\n"
+45          "  Then:      users                   to see who you can talk to\n"
+46          "             chat <their name>       to start chatting\n"
+47          "Type 'help' for all commands."
+48      )
+49  
+50      def __init__(self, client: ChatClient):
+51          super().__init__()
+52          self.client = client
+53          self._update_prompt()
 54  
-55      def postcmd(self, stop, line):
-56          self._update_prompt()
-57          return stop
+55      def _update_prompt(self):
+56          self.prompt = f"({self.client.username or 'not logged in'}) > "
+57  
+58      def postcmd(self, stop, line):
+59          self._update_prompt()
+60          return stop
 ```
 
-- **38** — `ChatShell` builds on `cmd.Cmd`.
-- **39–45** — The welcome text.
-- **47–50** — Constructor: remember the client and set the prompt.
-- **52–53** — The prompt shows who is logged in, e.g. `(bob) > `.
-- **55–57** — After every command, refresh the prompt (login or logout may have changed it).
+- **41** — `ChatShell` builds on `cmd.Cmd`.
+- **42–48** — The welcome text.
+- **50–53** — Constructor: remember the client and set the prompt.
+- **55–56** — The prompt shows who is logged in, e.g. `(bob) > `.
+- **58–60** — After every command, refresh the prompt (login or logout may have changed it).
 
-[`client/cli.py` lines 59–73](../client/cli.py#L59-L73)
+[`client/cli.py` lines 62–76](../client/cli.py#L62-L76)
 
 ```python
-59      def onecmd(self, line):
-60          # One place to turn errors into friendly messages.
-61          try:
-62              return super().onecmd(line)
-63          except ClientError as exc:
-64              print(f"Error: {exc}")
-65          except ConnectionError_ as exc:
-66              print(f"Connection problem: {exc}")
-67              print("The client will now exit. Start the server if needed, then run the client again.")
-68              return True
-69          except Exception as exc:  # a bug, not the user's fault: report it and keep the shell running
-70              print(f"Unexpected error ({exc.__class__.__name__}: {exc}). The command was not completed.")
-71  
-72      def emptyline(self):
-73          pass
+62      def onecmd(self, line):
+63          # One place to turn errors into friendly messages.
+64          try:
+65              return super().onecmd(line)
+66          except ClientError as exc:
+67              print(f"Error: {exc}")
+68          except ConnectionError_ as exc:
+69              print(f"Connection problem: {exc}")
+70              print("The client will now exit. Start the server if needed, then run the client again.")
+71              return True
+72          except Exception as exc:  # a bug, not the user's fault: report it and keep the shell running
+73              print(f"Unexpected error ({exc.__class__.__name__}: {exc}). The command was not completed.")
+74  
+75      def emptyline(self):
+76          pass
 ```
 
-- **59** — `onecmd` runs one typed line; overriding it gives one place to handle errors.
-- **60** — Comment.
-- **61–62** — Run the command normally.
-- **63–64** — A `ClientError` (wrong password, unknown user…) prints `Error: …` and the shell continues.
-- **65–68** — A `ConnectionError_` means the session is over: explain and return `True`, which makes `cmd` exit the loop.
-- **69–70** — Any other exception is a bug: report it, keep the shell running.
-- **72–73** — An empty line does nothing (by default `cmd` would repeat the last command).
+- **62** — `onecmd` runs one typed line; overriding it gives one place to handle errors.
+- **63** — Comment.
+- **64–65** — Run the command normally.
+- **66–67** — A `ClientError` (wrong password, unknown user…) prints `Error: …` and the shell continues.
+- **68–71** — A `ConnectionError_` means the session is over: explain and return `True`, which makes `cmd` exit the loop.
+- **72–73** — Any other exception is a bug: report it, keep the shell running.
+- **75–76** — An empty line does nothing (by default `cmd` would repeat the last command).
 
 ### Commands
 
-[`client/cli.py` lines 75–99](../client/cli.py#L75-L99)
+[`client/cli.py` lines 78–107](../client/cli.py#L78-L107)
 
 ```python
-75      # ---------------------------------------------------------- commands
-76  
-77      def do_signup(self, arg):
-78          """signup <username>  - create an account and a new key pair on this device"""
-79          username = arg.strip()
-80          if not username:
-81              print("Usage: signup <username>")
-82              return
-83          password = getpass.getpass("Choose a password (min 8 chars): ")
-84          if password != getpass.getpass("Repeat password: "):
-85              print("Passwords do not match.")
-86              return
-87          print("Generating keys (a few seconds)...")
-88          self.client.signup(username, password)
-89          print(f"Account created. Logged in as {username}.")
-90  
-91      def do_login(self, arg):
-92          """login <username>  - log in and unlock your private keys"""
-93          username = arg.strip()
-94          if not username:
-95              print("Usage: login <username>")
-96              return
-97          password = getpass.getpass("Password: ")
-98          self.client.login(username, password)
-99          print(f"Logged in as {username}.")
+ 78      # ---------------------------------------------------------- commands
+ 79  
+ 80      def do_signup(self, arg):
+ 81          """signup <username>  - create an account and a new key pair on this device"""
+ 82          username = arg.strip()
+ 83          if not username:
+ 84              print("Usage: signup <username>")
+ 85              return
+ 86          notice = self.client.privacy_notice()  # PDPA s.23: inform before collecting anything
+ 87          print(notice["text"])
+ 88          if input("Type 'yes' to accept this notice and create your account: ").strip().lower() != "yes":
+ 89              print("Sign-up cancelled. Nothing was sent or stored.")
+ 90              return
+ 91          password = getpass.getpass("Choose a password (min 8 chars): ")
+ 92          if password != getpass.getpass("Repeat password: "):
+ 93              print("Passwords do not match.")
+ 94              return
+ 95          print("Generating keys (a few seconds)...")
+ 96          self.client.signup(username, password, consent_version=notice["version"])
+ 97          print(f"Account created. Logged in as {username}.")
+ 98  
+ 99      def do_login(self, arg):
+100          """login <username>  - log in and unlock your private keys"""
+101          username = arg.strip()
+102          if not username:
+103              print("Usage: login <username>")
+104              return
+105          password = getpass.getpass("Password: ")
+106          self.client.login(username, password)
+107          print(f"Logged in as {username}.")
 ```
 
-- **75** — Section comment.
-- **77–78** — `signup <name>`; the docstring is what `help signup` shows.
-- **79–82** — Require a name.
-- **83** — Read the password without echo.
-- **84–86** — Read it again; refuse if they differ.
-- **87** — Warn that key generation takes a moment.
-- **88** — Sign up (section 4.2).
-- **89** — Confirm.
-- **91–92** — `login <name>`.
-- **93–96** — Require a name.
-- **97** — Read the password without echo.
-- **98** — Log in.
-- **99** — Confirm.
+- **78** — Section comment.
+- **80–81** — `signup <name>`; the docstring is what `help signup` shows.
+- **82–85** — Require a name.
+- **86** — Fetch the privacy notice from the server (PDPA s.23: inform people **before** collecting anything).
+- **87** — Show it.
+- **88–90** — Continue only if the person types `yes`. Otherwise stop: no keys are made and nothing is sent or stored.
+- **91** — Read the password without echo.
+- **92–94** — Read it again; refuse if they differ.
+- **95** — Warn that key generation takes a moment.
+- **96** — Sign up (section 4.2), passing the version of the notice the person accepted, which the server records.
+- **97** — Confirm.
+- **99–100** — `login <name>`.
+- **101–104** — Require a name.
+- **105** — Read the password without echo.
+- **106** — Log in.
+- **107** — Confirm.
 
-[`client/cli.py` lines 101–116](../client/cli.py#L101-L116)
+[`client/cli.py` lines 109–124](../client/cli.py#L109-L124)
 
 ```python
-101      def do_users(self, arg):
-102          """users  - list other users with their public-key fingerprints"""
-103          users = self.client.users()
-104          if not users:
-105              print("No other users yet.")
-106          for u in users:
-107              print(f"  {u['username']:<20} {u['fingerprint']}  ({u['key_status']})")
-108  
-109      def do_send(self, arg):
-110          """send <recipient> <message>  - encrypt, sign and send a message"""
-111          parts = arg.split(maxsplit=1)
-112          if len(parts) != 2:
-113              print("Usage: send <recipient> <message>")
-114              return
-115          msg_id = self.client.send(parts[0], parts[1])
-116          print(f"Sent (message ID {msg_id}).")
+109      def do_users(self, arg):
+110          """users  - list other users with their public-key fingerprints"""
+111          users = self.client.users()
+112          if not users:
+113              print("No other users yet.")
+114          for u in users:
+115              print(f"  {u['username']:<20} {u['fingerprint']}  ({u['key_status']})")
+116  
+117      def do_send(self, arg):
+118          """send <recipient> <message>  - encrypt, sign and send a message"""
+119          parts = arg.split(maxsplit=1)
+120          if len(parts) != 2:
+121              print("Usage: send <recipient> <message>")
+122              return
+123          msg_id = self.client.send(parts[0], parts[1])
+124          print(f"Sent (message ID {msg_id}).")
 ```
 
-- **101–102** — `users`.
-- **103** — Fetch with pinning applied.
-- **104–105** — Nobody else yet.
-- **106–107** — Print each name, fingerprint and pin status. (Names come from the server but always match the strict username pattern.)
-- **109–110** — `send <recipient> <message>`.
-- **111** — Split into the recipient and the rest of the line (the message may contain spaces).
-- **112–114** — Require both.
-- **115** — Encrypt, sign, send.
-- **116** — Show the message ID.
+- **109–110** — `users`.
+- **111** — Fetch with pinning applied.
+- **112–113** — Nobody else yet.
+- **114–115** — Print each name, fingerprint and pin status. (Names come from the server but always match the strict username pattern.)
+- **117–118** — `send <recipient> <message>`.
+- **119** — Split into the recipient and the rest of the line (the message may contain spaces).
+- **120–122** — Require both.
+- **123** — Encrypt, sign, send.
+- **124** — Show the message ID.
 
-[`client/cli.py` lines 118–130](../client/cli.py#L118-L130)
+[`client/cli.py` lines 126–138](../client/cli.py#L126-L138)
 
 ```python
-118      def do_inbox(self, arg):
-119          """inbox  - fetch new messages, verify each signature, then decrypt"""
-120          results = self.client.inbox()
-121          if not results:
-122              print("No new messages.")
-123          for r in results:
-124              when = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S") if r["timestamp"] else "?"
-125              sender = safe_display(r["sender"])[:40]
-126              if r["ok"]:
-127                  print(f"  [{when}] {sender}: {safe_display(r['text'])}   (signature OK)")
-128              else:
-129                  print(f"  !! REJECTED message claiming to be from {sender} ({when})")
-130                  print(f"     reason: {safe_display(r['reason'])}")
+126      def do_inbox(self, arg):
+127          """inbox  - fetch new messages, verify each signature, then decrypt"""
+128          results = self.client.inbox()
+129          if not results:
+130              print("No new messages.")
+131          for r in results:
+132              when = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S") if r["timestamp"] else "?"
+133              sender = safe_display(r["sender"])[:40]
+134              if r["ok"]:
+135                  print(f"  [{when}] {sender}: {safe_display(r['text'])}   (signature OK)")
+136              else:
+137                  print(f"  !! REJECTED message claiming to be from {sender} ({when})")
+138                  print(f"     reason: {safe_display(r['reason'])}")
 ```
 
-- **118–119** — `inbox`.
-- **120** — Fetch and open every waiting package.
-- **121–122** — Nothing new.
-- **123** — For each result…
-- **124** — …format its time, or `?` if none.
-- **125** — Make the sender name safe and short.
-- **126–127** — Accepted: print time, sender and the **safe** text.
-- **128–130** — Rejected: a clear warning with the safe reason.
+- **126–127** — `inbox`.
+- **128** — Fetch and open every waiting package.
+- **129–130** — Nothing new.
+- **131** — For each result…
+- **132** — …format its time, or `?` if none.
+- **133** — Make the sender name safe and short.
+- **134–135** — Accepted: print time, sender and the **safe** text.
+- **136–138** — Rejected: a clear warning with the safe reason.
 
 ### Chat mode
 
-[`client/cli.py` lines 132–149](../client/cli.py#L132-L149)
+[`client/cli.py` lines 140–157](../client/cli.py#L140-L157)
 
 ```python
-132      def do_chat(self, arg):
-133          """chat <username>  - live conversation; type /exit to leave"""
-134          peer = arg.strip()
-135          if not peer:
-136              print("Usage: chat <username>   (type 'users' to see who is here)")
-137              return
-138          if self.client.username is None:
-139              raise ClientError("Please log in first.")
-140          if peer == self.client.username:
-141              raise ClientError("You cannot chat with yourself.")
-142          info = self.client._trusted_keys(peer)  # raises if unknown or if the key changed
-143  
-144          me = self.client.username
-145          prompt = f"{me}> "
-146          print(f"--- Chat with {peer} ---")
-147          print(f"    {peer}'s key fingerprint: {info['fingerprint']}")
-148          print("    Every message is encrypted for them and signed by you. Type /exit to leave.")
-149          print()
+140      def do_chat(self, arg):
+141          """chat <username>  - live conversation; type /exit to leave"""
+142          peer = arg.strip()
+143          if not peer:
+144              print("Usage: chat <username>   (type 'users' to see who is here)")
+145              return
+146          if self.client.username is None:
+147              raise ClientError("Please log in first.")
+148          if peer == self.client.username:
+149              raise ClientError("You cannot chat with yourself.")
+150          info = self.client._trusted_keys(peer)  # raises if unknown or if the key changed
+151  
+152          me = self.client.username
+153          prompt = f"{me}> "
+154          print(f"--- Chat with {peer} ---")
+155          print(f"    {peer}'s key fingerprint: {info['fingerprint']}")
+156          print("    Every message is encrypted for them and signed by you. Type /exit to leave.")
+157          print()
 ```
 
-- **132–133** — `chat <name>` starts a live conversation.
-- **134** — The partner's name.
-- **135–137** — Require it.
-- **138–139** — Must be logged in.
-- **140–141** — Not with yourself.
-- **142** — Get their keys (pinned and checked); this fails cleanly if they don't exist or their key changed.
-- **144** — Your name.
-- **145** — The chat prompt, e.g. `bob> `.
-- **146–149** — Print a header with the partner's fingerprint, for comparing in person.
+- **140–141** — `chat <name>` starts a live conversation.
+- **142** — The partner's name.
+- **143–145** — Require it.
+- **146–147** — Must be logged in.
+- **148–149** — Not with yourself.
+- **150** — Get their keys (pinned and checked); this fails cleanly if they don't exist or their key changed.
+- **152** — Your name.
+- **153** — The chat prompt, e.g. `bob> `.
+- **154–157** — Print a header with the partner's fingerprint, for comparing in person.
 
-[`client/cli.py` lines 151–159](../client/cli.py#L151-L159)
+[`client/cli.py` lines 159–167](../client/cli.py#L159-L167)
 
 ```python
-151          print_lock = threading.Lock()
-152          stop = threading.Event()
-153  
-154          def show(text):
-155              # Print above the prompt, then redraw the prompt.
-156              with print_lock:
-157                  sys.stdout.write("\r" + " " * (len(prompt) + 40) + "\r")
-158                  sys.stdout.write(text + "\n" + prompt)
-159                  sys.stdout.flush()
+159          print_lock = threading.Lock()
+160          stop = threading.Event()
+161  
+162          def show(text):
+163              # Print above the prompt, then redraw the prompt.
+164              with print_lock:
+165                  sys.stdout.write("\r" + " " * (len(prompt) + 40) + "\r")
+166                  sys.stdout.write(text + "\n" + prompt)
+167                  sys.stdout.flush()
 ```
 
-- **151** — A lock so the two threads never print at the same moment.
-- **152** — An `Event` used to tell the listener to stop.
-- **154** — `show` prints an incoming line above the prompt.
-- **155** — Comment.
-- **156** — Hold the print lock.
-- **157** — `\r` returns to the start of the line; spaces wipe the prompt; `\r` again.
-- **158** — Print the message, a newline, and the prompt again.
-- **159** — Flush so it appears now.
+- **159** — A lock so the two threads never print at the same moment.
+- **160** — An `Event` used to tell the listener to stop.
+- **162** — `show` prints an incoming line above the prompt.
+- **163** — Comment.
+- **164** — Hold the print lock.
+- **165** — `\r` returns to the start of the line; spaces wipe the prompt; `\r` again.
+- **166** — Print the message, a newline, and the prompt again.
+- **167** — Flush so it appears now.
 
-[`client/cli.py` lines 161–185](../client/cli.py#L161-L185)
+[`client/cli.py` lines 169–193](../client/cli.py#L169-L193)
 
 ```python
-161          def receive_loop():
-162              # Check the inbox once a second; verify and decrypt whatever arrived.
-163              # Everything printed from a message goes through safe_display so a
-164              # sender cannot inject fake lines or terminal escape codes.
-165              while not stop.is_set():
-166                  try:
-167                      for r in self.client.inbox():
-168                          when = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%H:%M") \
-169                              if r["timestamp"] else "--:--"
-170                          sender = safe_display(r["sender"])[:40]
-171                          if not r["ok"]:
-172                              show(f"[{when}] !! REJECTED a message claiming to be from {sender}: "
-173                                   f"{safe_display(r['reason'])}")
-174                          elif r["sender"] == peer:
-175                              show(f"[{when}] {peer}: {safe_display(r['text'])}")
-176                          else:
-177                              show(f"[{when}] (from {sender}) {safe_display(r['text'])}")
-178                  except ConnectionError_ as exc:
-179                      show(f"!! {exc}  Type /exit.")
-180                      return  # nothing more can arrive on a dead connection
-181                  except ClientError as exc:
-182                      show(f"!! could not check messages: {exc}")
-183                  except Exception as exc:  # never let the listener die silently
-184                      show(f"!! unexpected error while checking messages ({exc.__class__.__name__})")
-185                  stop.wait(1.0)
+169          def receive_loop():
+170              # Check the inbox once a second; verify and decrypt whatever arrived.
+171              # Everything printed from a message goes through safe_display so a
+172              # sender cannot inject fake lines or terminal escape codes.
+173              while not stop.is_set():
+174                  try:
+175                      for r in self.client.inbox():
+176                          when = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%H:%M") \
+177                              if r["timestamp"] else "--:--"
+178                          sender = safe_display(r["sender"])[:40]
+179                          if not r["ok"]:
+180                              show(f"[{when}] !! REJECTED a message claiming to be from {sender}: "
+181                                   f"{safe_display(r['reason'])}")
+182                          elif r["sender"] == peer:
+183                              show(f"[{when}] {peer}: {safe_display(r['text'])}")
+184                          else:
+185                              show(f"[{when}] (from {sender}) {safe_display(r['text'])}")
+186                  except ConnectionError_ as exc:
+187                      show(f"!! {exc}  Type /exit.")
+188                      return  # nothing more can arrive on a dead connection
+189                  except ClientError as exc:
+190                      show(f"!! could not check messages: {exc}")
+191                  except Exception as exc:  # never let the listener die silently
+192                      show(f"!! unexpected error while checking messages ({exc.__class__.__name__})")
+193                  stop.wait(1.0)
 ```
 
-- **161** — `receive_loop` runs in the background thread.
-- **162–164** — Comment: everything from a message goes through `safe_display`.
-- **165** — Until told to stop…
-- **166–167** — …check the inbox (verifies and decrypts everything new).
-- **168–169** — Format the time as hours:minutes.
-- **170** — Make the sender name safe.
-- **171–173** — Rejected: show a warning with the reason.
-- **174–175** — From the partner: show `[time] name: text`.
-- **176–177** — From someone else: show it labelled with their name.
-- **178–180** — Connection lost: say so once and end the thread, since nothing more can arrive.
-- **181–182** — Other client errors: show and keep going.
-- **183–184** — Anything unexpected: show a short message; the listener never dies silently.
-- **185** — Wait one second (or less if told to stop).
+- **169** — `receive_loop` runs in the background thread.
+- **170–172** — Comment: everything from a message goes through `safe_display`.
+- **173** — Until told to stop…
+- **174–175** — …check the inbox (verifies and decrypts everything new).
+- **176–177** — Format the time as hours:minutes.
+- **178** — Make the sender name safe.
+- **179–181** — Rejected: show a warning with the reason.
+- **182–183** — From the partner: show `[time] name: text`.
+- **184–185** — From someone else: show it labelled with their name.
+- **186–188** — Connection lost: say so once and end the thread, since nothing more can arrive.
+- **189–190** — Other client errors: show and keep going.
+- **191–192** — Anything unexpected: show a short message; the listener never dies silently.
+- **193** — Wait one second (or less if told to stop).
 
-[`client/cli.py` lines 187–209](../client/cli.py#L187-L209)
+[`client/cli.py` lines 195–217](../client/cli.py#L195-L217)
 
 ```python
-187          listener = threading.Thread(target=receive_loop, daemon=True)
-188          listener.start()
-189          try:
-190              while True:
-191                  line = input(prompt)
-192                  text = line.strip()
-193                  if text in ("/exit", "/quit", "/back"):
-194                      break
-195                  if not text:
-196                      continue
-197                  try:
-198                      self.client.send(peer, text)
-199                  except ClientError as exc:
-200                      show(f"!! not sent: {exc}")
-201                  except ConnectionError_ as exc:
-202                      show(f"!! not sent: {exc}")
-203                      break
-204          except (EOFError, KeyboardInterrupt):
-205              print()
-206          finally:
-207              stop.set()
-208              listener.join(timeout=5)
-209          print(f"--- Left chat with {peer} ---")
+195          listener = threading.Thread(target=receive_loop, daemon=True)
+196          listener.start()
+197          try:
+198              while True:
+199                  line = input(prompt)
+200                  text = line.strip()
+201                  if text in ("/exit", "/quit", "/back"):
+202                      break
+203                  if not text:
+204                      continue
+205                  try:
+206                      self.client.send(peer, text)
+207                  except ClientError as exc:
+208                      show(f"!! not sent: {exc}")
+209                  except ConnectionError_ as exc:
+210                      show(f"!! not sent: {exc}")
+211                      break
+212          except (EOFError, KeyboardInterrupt):
+213              print()
+214          finally:
+215              stop.set()
+216              listener.join(timeout=5)
+217          print(f"--- Left chat with {peer} ---")
 ```
 
-- **187–188** — Start the listener as a daemon thread (it won't keep the program alive).
-- **189–190** — The main thread reads what you type.
-- **191** — Wait for a line.
-- **192** — Trim spaces.
-- **193–194** — `/exit`, `/quit` or `/back` leaves the chat.
-- **195–196** — Ignore empty lines.
-- **197–198** — Encrypt, sign and send to the partner.
-- **199–200** — A refused message (too long, key changed…): show why, keep chatting.
-- **201–203** — Connection lost: show it and leave the chat.
-- **204–205** — Ctrl+C or end-of-input also leaves.
-- **206–208** — In every case, tell the listener to stop and wait up to 5 seconds for it.
-- **209** — Confirm you have left.
+- **195–196** — Start the listener as a daemon thread (it won't keep the program alive).
+- **197–198** — The main thread reads what you type.
+- **199** — Wait for a line.
+- **200** — Trim spaces.
+- **201–202** — `/exit`, `/quit` or `/back` leaves the chat.
+- **203–204** — Ignore empty lines.
+- **205–206** — Encrypt, sign and send to the partner.
+- **207–208** — A refused message (too long, key changed…): show why, keep chatting.
+- **209–211** — Connection lost: show it and leave the chat.
+- **212–213** — Ctrl+C or end-of-input also leaves.
+- **214–216** — In every case, tell the listener to stop and wait up to 5 seconds for it.
+- **217** — Confirm you have left.
 
-[`client/cli.py` lines 211–227](../client/cli.py#L211-L227)
+[`client/cli.py` lines 219–251](../client/cli.py#L219-L251)
 
 ```python
-211      def do_verbose(self, arg):
-212          """verbose on|off  - show every crypto step"""
-213          on = arg.strip().lower() in ("on", "1", "yes", "")
-214          self.client.trace = print_step if on else silent
-215          print(f"Verbose mode {'on' if on else 'off'}.")
-216  
-217      def do_logout(self, arg):
-218          """logout"""
-219          self.client.logout()
-220          print("Logged out.")
-221  
-222      def do_quit(self, arg):
-223          """quit"""
-224          return True
-225  
-226      do_exit = do_quit
-227      do_EOF = do_quit
+219      def do_verbose(self, arg):
+220          """verbose on|off  - show every crypto step"""
+221          on = arg.strip().lower() in ("on", "1", "yes", "")
+222          self.client.trace = print_step if on else silent
+223          print(f"Verbose mode {'on' if on else 'off'}.")
+224  
+225      def do_mydata(self, arg):
+226          """mydata  - show everything the server stores about you (PDPA right of access)"""
+227          print(json.dumps(self.client.mydata(), indent=2))
+228  
+229      def do_delete_account(self, arg):
+230          """delete_account  - erase your account, your waiting messages and this device's keys"""
+231          if self.client.username is None:
+232              raise ClientError("Please log in first.")
+233          print("This permanently deletes your account, messages waiting for you, and your keys on this device.")
+234          if input(f"Type your username ({self.client.username}) to confirm: ").strip() != self.client.username:
+235              print("Cancelled.")
+236              return
+237          password = getpass.getpass("Password: ")
+238          self.client.delete_account(password)
+239          print("Your account and data have been deleted.")
+240  
+241      def do_logout(self, arg):
+242          """logout"""
+243          self.client.logout()
+244          print("Logged out.")
+245  
+246      def do_quit(self, arg):
+247          """quit"""
+248          return True
+249  
+250      do_exit = do_quit
+251      do_EOF = do_quit
 ```
 
-- **211–212** — `verbose on|off`.
-- **213** — `on`, `1`, `yes` or nothing at all means on.
-- **214** — Swap in the step printer or the silent one.
-- **215** — Confirm.
-- **217–220** — `logout`.
-- **222–224** — `quit` returns `True`, which ends the `cmd` loop.
-- **226–227** — `exit` and end-of-input (Ctrl+Z on Windows) do the same as `quit`.
+- **219–220** — `verbose on|off`.
+- **221** — `on`, `1`, `yes` or nothing at all means on.
+- **222** — Swap in the step printer or the silent one.
+- **223** — Confirm.
+- **225–226** — `mydata`: the right of access.
+- **227** — Print everything the server holds about you as indented JSON, which a person can read and a program can import (portability).
+- **229–230** — `delete_account`: the right to erasure.
+- **231–232** — Must be logged in.
+- **233** — Say plainly what will be deleted.
+- **234–236** — Ask the person to type their own username to confirm; anything else cancels. This guards against deleting by accident.
+- **237** — Ask for the password (without echo); the server checks it again.
+- **238** — Erase on the server and on this device.
+- **239** — Confirm.
+- **241–244** — `logout`.
+- **246–248** — `quit` returns `True`, which ends the `cmd` loop.
+- **250–251** — `exit` and end-of-input (Ctrl+Z on Windows) do the same as `quit`.
 
 ### Starting the client
 
-[`client/cli.py` lines 230–261](../client/cli.py#L230-L261)
+[`client/cli.py` lines 254–285](../client/cli.py#L254-L285)
 
 ```python
-230  def main():
-231      parser = argparse.ArgumentParser(description="Secure chat client")
-232      parser.add_argument("--host", default="127.0.0.1")
-233      parser.add_argument("--port", type=int, default=5050)
-234      parser.add_argument("--data", default="client_data", help="folder for this device's encrypted keys")
-235      parser.add_argument("--ca", default=DEFAULT_CA_FILE,
-236                          help="the server's CA certificate (copy of server_data\\tls\\ca.crt)")
-237      args = parser.parse_args()
-238      try:
-239          client = ChatClient(args.host, args.port, args.data, trace=silent, ca_file=args.ca)
-240      except ConnectionError_ as exc:
-241          print(exc)
-242          if "Cannot reach" in str(exc):
-243              print("Start the server first:  py -m server.server")
-244          return
-245      shell = ChatShell(client)
-246      shell.intro = (f"Connected securely ({client.conn.tls_version}, {client.conn.cipher}); "
-247                     "server identity verified.\n" + shell.intro)
-248      try:
-249          while True:
-250              try:
-251                  shell.cmdloop()
-252                  break
-253              except KeyboardInterrupt:  # Ctrl+C at the prompt: don't crash, explain how to leave
-254                  print("\n(Type 'quit' to exit.)")
-255                  shell.intro = None
-256      finally:
-257          client.close()
-258  
-259  
-260  if __name__ == "__main__":
-261      main()
+254  def main():
+255      parser = argparse.ArgumentParser(description="Secure chat client")
+256      parser.add_argument("--host", default="127.0.0.1")
+257      parser.add_argument("--port", type=int, default=5050)
+258      parser.add_argument("--data", default="client_data", help="folder for this device's encrypted keys")
+259      parser.add_argument("--ca", default=DEFAULT_CA_FILE,
+260                          help="the server's CA certificate (copy of server_data\\tls\\ca.crt)")
+261      args = parser.parse_args()
+262      try:
+263          client = ChatClient(args.host, args.port, args.data, trace=silent, ca_file=args.ca)
+264      except ConnectionError_ as exc:
+265          print(exc)
+266          if "Cannot reach" in str(exc):
+267              print("Start the server first:  py -m server.server")
+268          return
+269      shell = ChatShell(client)
+270      shell.intro = (f"Connected securely ({client.conn.tls_version}, {client.conn.cipher}); "
+271                     "server identity verified.\n" + shell.intro)
+272      try:
+273          while True:
+274              try:
+275                  shell.cmdloop()
+276                  break
+277              except KeyboardInterrupt:  # Ctrl+C at the prompt: don't crash, explain how to leave
+278                  print("\n(Type 'quit' to exit.)")
+279                  shell.intro = None
+280      finally:
+281          client.close()
+282  
+283  
+284  if __name__ == "__main__":
+285      main()
 ```
 
-- **230** — `main` runs for `py -m client.cli`.
-- **231** — Option parser.
-- **232** — `--host`, the server address.
-- **233** — `--port`.
-- **234** — `--data`, this device's folder for keys and lists.
-- **235–236** — `--ca`, the copy of the server's `ca.crt`.
-- **237** — Parse.
-- **238–239** — Create the client, which opens the TLS connection.
-- **240–244** — If that fails, print why; if the server simply isn't running, say how to start it; then exit.
-- **245** — Create the shell.
-- **246–247** — Put the TLS version, cipher and "server identity verified" above the welcome text.
-- **248–252** — Run the shell until `quit`.
-- **253–255** — Ctrl+C at the prompt: don't crash; explain how to leave and keep going (without repeating the welcome text).
-- **256–257** — In every case close the connection at the end.
-- **260–261** — Run `main()` when executed as a program.
+- **254** — `main` runs for `py -m client.cli`.
+- **255** — Option parser.
+- **256** — `--host`, the server address.
+- **257** — `--port`.
+- **258** — `--data`, this device's folder for keys and lists.
+- **259–260** — `--ca`, the copy of the server's `ca.crt`.
+- **261** — Parse.
+- **262–263** — Create the client, which opens the TLS connection.
+- **264–268** — If that fails, print why; if the server simply isn't running, say how to start it; then exit.
+- **269** — Create the shell.
+- **270–271** — Put the TLS version, cipher and "server identity verified" above the welcome text.
+- **272–276** — Run the shell until `quit`.
+- **277–279** — Ctrl+C at the prompt: don't crash; explain how to leave and keep going (without repeating the welcome text).
+- **280–281** — In every case close the connection at the end.
+- **284–285** — Run `main()` when executed as a program.

@@ -10,6 +10,8 @@ Commands:
     send <recipient> <message> encrypt, sign and send one message
     inbox                      fetch, verify and decrypt new messages
     verbose on|off             print each crypto step as it happens
+    mydata                     show everything the server stores about you
+    delete_account             erase your account and data (asks to confirm)
     logout
     quit
 """
@@ -18,6 +20,7 @@ import argparse
 import cmd
 import datetime
 import getpass
+import json
 import sys
 import threading
 
@@ -80,12 +83,17 @@ class ChatShell(cmd.Cmd):
         if not username:
             print("Usage: signup <username>")
             return
+        notice = self.client.privacy_notice()  # PDPA s.23: inform before collecting anything
+        print(notice["text"])
+        if input("Type 'yes' to accept this notice and create your account: ").strip().lower() != "yes":
+            print("Sign-up cancelled. Nothing was sent or stored.")
+            return
         password = getpass.getpass("Choose a password (min 8 chars): ")
         if password != getpass.getpass("Repeat password: "):
             print("Passwords do not match.")
             return
         print("Generating keys (a few seconds)...")
-        self.client.signup(username, password)
+        self.client.signup(username, password, consent_version=notice["version"])
         print(f"Account created. Logged in as {username}.")
 
     def do_login(self, arg):
@@ -213,6 +221,22 @@ class ChatShell(cmd.Cmd):
         on = arg.strip().lower() in ("on", "1", "yes", "")
         self.client.trace = print_step if on else silent
         print(f"Verbose mode {'on' if on else 'off'}.")
+
+    def do_mydata(self, arg):
+        """mydata  - show everything the server stores about you (PDPA right of access)"""
+        print(json.dumps(self.client.mydata(), indent=2))
+
+    def do_delete_account(self, arg):
+        """delete_account  - erase your account, your waiting messages and this device's keys"""
+        if self.client.username is None:
+            raise ClientError("Please log in first.")
+        print("This permanently deletes your account, messages waiting for you, and your keys on this device.")
+        if input(f"Type your username ({self.client.username}) to confirm: ").strip() != self.client.username:
+            print("Cancelled.")
+            return
+        password = getpass.getpass("Password: ")
+        self.client.delete_account(password)
+        print("Your account and data have been deleted.")
 
     def do_logout(self, arg):
         """logout"""
