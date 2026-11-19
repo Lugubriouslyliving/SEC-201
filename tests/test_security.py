@@ -106,6 +106,8 @@ class MessageCryptoTests(unittest.TestCase):
                 raw = bytearray(b64d(pkg[field]))
                 raw[-1] ^= 0x01
                 pkg[field] = base64.b64encode(bytes(raw)).decode()
+            elif field == "msg_id":  # change one hex digit, so it is still a well-formed ID
+                pkg[field] = pkg[field][:-1] + ("0" if pkg[field][-1] != "0" else "1")
             else:
                 pkg[field] = pkg[field] + "x"
             with self.subTest(field=field), self.assertRaises(MessageRejected) as cm:

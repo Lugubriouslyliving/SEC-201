@@ -45,7 +45,7 @@ log.addHandler(logging.NullHandler())  # silent unless main() configures logging
 
 USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
 MAX_LINE = 1_000_000          # bytes; a request bigger than this is refused
-MAX_MSG_ID_LEN = 64
+MSG_ID_RE = re.compile(r"[0-9a-f]{32}")  # exactly what uuid4().hex produces; nothing else is accepted
 MIN_RSA_BITS = 2048
 MAX_CLOCK_SKEW = 300          # seconds; package timestamps must be within this of server time
 HANDSHAKE_TIMEOUT = 15        # seconds a new connection gets to complete the TLS handshake
@@ -150,7 +150,7 @@ class ChatApp:
         # length are therefore checked by the client.
         username, login_hash = req["username"], req["password_hash"]
         enc_pem, sign_pem = req["enc_public_pem"], req["sign_public_pem"]
-        if not isinstance(username, str) or not USERNAME_RE.match(username):
+        if not isinstance(username, str) or not USERNAME_RE.fullmatch(username):  # fullmatch: no trailing "\n"
             return {"ok": False, "error": "Username must be 3-20 characters: a-z, 0-9, _."}
         if not is_login_hash(login_hash):
             return {"ok": False, "error": "password_hash must be the client's 32-byte login hash (base64)."}
@@ -231,8 +231,8 @@ class ChatApp:
             return {"ok": False, "error": f"Package is missing fields: {', '.join(missing)}."}
         if not all(isinstance(pkg[f], str) for f in PACKAGE_STRING_FIELDS):
             return {"ok": False, "error": "Package fields have the wrong type."}
-        if not 1 <= len(pkg["msg_id"]) <= MAX_MSG_ID_LEN:
-            return {"ok": False, "error": "Invalid message ID."}
+        if not MSG_ID_RE.fullmatch(pkg["msg_id"]):  # so an ID can never carry newlines or escape codes
+            return {"ok": False, "error": "Invalid message ID (must be 32 lowercase hex characters)."}
 
         # The logged-in user may only send as themselves. (Recipients still
         # verify the signature: they must not have to trust the server.)

@@ -10,6 +10,7 @@ Run:  py -m unittest tests.test_edge_cases -v
 
 import base64
 import json
+import logging
 import os
 import shutil
 import socket
@@ -24,7 +25,7 @@ from client.connection import ConnectionError_
 from client.session import MAX_MESSAGE_CHARS, ChatClient, ClientError, safe_display
 from crypto_utils.encoding import b64d, b64e
 from crypto_utils.keys import UserKeys
-from crypto_utils.messages import MessageRejected, encrypt_and_sign, verify_and_decrypt
+from crypto_utils.messages import MessageRejected, _signed_bytes, encrypt_and_sign, verify_and_decrypt
 from crypto_utils.passwords import client_password_hash
 from crypto_utils.tls import client_context
 from server.server import MAX_LINE, start_in_background
@@ -169,6 +170,51 @@ class ProtocolAbuseTests(ServerFixture):
             finally:
                 s.close()
         self.assert_server_alive()
+
+    def test_message_ids_must_be_hex_so_logs_cannot_be_forged(self):
+        """Regression for V1: a sender-chosen message ID carrying a newline and an
+        escape code used to be printed raw in the server log and in verbose traces."""
+        alice, eve = self.user("v1_alice"), self.user("v1_eve")
+        records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: records.append(record.getMessage())
+        server_log = logging.getLogger("server")
+        server_log.addHandler(handler)
+        old_level = server_log.level
+        server_log.setLevel(logging.INFO)
+        self.addCleanup(server_log.removeHandler, handler)
+        self.addCleanup(server_log.setLevel, old_level)
+
+        attack = "x\n2026-01-01 [server] login: admin\x1b[31m"
+        for bad_id in (attack, "A" * 32, "g" * 32, "0" * 31, "0" * 33, "0" * 32 + "\n"):
+            pkg = encrypt_and_sign("hi", "v1_eve", "v1_alice", eve.keys, alice.keys.enc_public_pem())
+            pkg["msg_id"] = bad_id
+            pkg["signature"] = b64e(eve.keys.sign_private.sign(_signed_bytes(pkg)))
+            with self.subTest(msg_id=bad_id[:12]):
+                self.assertFalse(eve.conn.request({"action": "send", "package": pkg})["ok"])  # server refuses
+                traces = []
+                alice.trace = lambda step, detail="": traces.append(detail)
+                result = alice.open_package(pkg)  # as if a malicious server delivered it anyway
+                alice.trace = lambda step, detail="": None
+                self.assertFalse(result["ok"])
+                self.assertIn("malformed", result["reason"])
+                self.assertFalse(any("\x1b" in t or "\n2026" in t for t in traces), traces)
+        self.assertFalse(any("\x1b" in r or "\n" in r for r in records), records)
+        self.assertFalse(any("login: admin" in r for r in records), records)
+        # A normal message still goes through.
+        eve.send("v1_alice", "still works")
+        self.assertEqual([r["text"] for r in alice.inbox()], ["still works"])
+
+    def test_username_with_trailing_newline_is_refused(self):
+        """`$` in a regex also matches before a final newline, so "alice\\n" used to pass."""
+        keys = UserKeys.generate()
+        for name in ("nlname\n", "nlname\r\n", "\nnlname"):
+            req = {"action": "signup", "username": name, "password_hash": client_password_hash(name, PW),
+                   "enc_public_pem": keys.enc_public_pem(), "sign_public_pem": keys.sign_public_pem()}
+            with self.subTest(name=repr(name)):
+                self.assertFalse(self.raw(json.dumps(req).encode() + b"\n")["ok"])
+                with self.assertRaises(ClientError):
+                    self.client("nl").signup(name, PW)
 
     def test_signup_rejects_fake_public_keys(self):
         good = UserKeys.generate()

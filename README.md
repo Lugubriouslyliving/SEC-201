@@ -16,6 +16,10 @@ the server's own certificate.
 Every algorithm comes from the Python [`cryptography`](https://cryptography.io)
 library. Nothing cryptographic is written by hand.
 
+**Full technical documentation** is in [`docs/`](docs/README.md): a step-by-step
+walkthrough of the whole system, a line-by-line explanation of every source file, and
+a security, integrity and privacy analysis listing known vulnerabilities.
+
 ---
 
 ## Contents
@@ -160,7 +164,7 @@ py demo.py --pause
 The demo starts its own server on a free port with a temporary database and deletes
 it at the end, so it does not touch `server_data` or `client_data`.
 
-**Automated tests** (68 tests, about 70 seconds):
+**Automated tests** (70 tests, about 70 seconds):
 
 ```powershell
 py -m unittest -v
@@ -185,7 +189,7 @@ The tests are in three files:
 | Missing or junk `ca.crt` | Clear error |
 | The CA's private key | Not stored anywhere |
 
-- `tests/test_edge_cases.py` (34 tests) checks that the app keeps working under
+- `tests/test_edge_cases.py` (36 tests) checks that the app keeps working under
   extreme or hostile conditions:
 
 | Area | What is thrown at it |
@@ -368,7 +372,8 @@ an `"ok": false` reply; the server never crashes or drops other users because of
   ASCII only, so both sides produce the same bytes.
 
 **Server checks on `send`:** all fields present; `sender` equals the logged-in user;
-recipient exists; `msg_id` never seen; `timestamp` within 5 minutes of server time.
+recipient exists; `msg_id` is exactly 32 lowercase hex characters and never seen
+before; `timestamp` within 5 minutes of server time.
 The server does **not** check the signature or decrypt anything; that is the
 recipient's job, because the recipient should not have to trust the server.
 
@@ -589,9 +594,10 @@ secure-chat/
 │   └── encoding.py     base64 and canonical JSON
 ├── tests/
 │   ├── test_security.py    25 tests: each protection (unit + end-to-end over real sockets)
-│   ├── test_edge_cases.py  34 tests: hostile input, extreme values, load, crashes, restarts
+│   ├── test_edge_cases.py  36 tests: hostile input, extreme values, load, crashes, restarts
 │   ├── test_tls.py         9 tests: eavesdropping, replay, fake servers, TLS versions
 │   └── mitm.py             recording proxy used as the "eavesdropper"
+├── docs/               how it works, line-by-line code walkthrough, security analysis
 ├── demo.py             guided demonstration of all eight scenarios
 ├── requirements.txt
 └── README.md

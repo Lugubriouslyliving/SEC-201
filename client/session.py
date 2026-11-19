@@ -125,7 +125,7 @@ class ChatClient:
     # ------------------------------------------------------------ accounts
 
     def signup(self, username: str, password: str) -> None:
-        if not isinstance(username, str) or not USERNAME_RE.match(username):
+        if not isinstance(username, str) or not USERNAME_RE.fullmatch(username):
             raise ClientError("Username must be 3-20 characters using only a-z, 0-9 and _ (lowercase).")
         if not MIN_PASSWORD_LEN <= len(password) <= MAX_PASSWORD_LEN:
             raise ClientError(f"Password must be {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} characters.")
@@ -156,7 +156,7 @@ class ChatClient:
     def login(self, username: str, password: str) -> None:
         # A name that cannot exist is refused here, without contacting the
         # server, so text typed into the wrong box is not sent anywhere.
-        if not isinstance(username, str) or not USERNAME_RE.match(username) or len(password) > MAX_PASSWORD_LEN:
+        if not isinstance(username, str) or not USERNAME_RE.fullmatch(username) or len(password) > MAX_PASSWORD_LEN:
             raise ClientError("Invalid username or password.")
         self._request({"action": "login", "username": username,
                        "password_hash": self._hash_password(username, password)})
@@ -288,7 +288,7 @@ class ChatClient:
             if not is_dict:
                 raise MessageRejected("malformed package (not an object)")
             sender_keys = self._trusted_keys(sender)
-            self.trace("RECEIVE", f"package {result['msg_id']} claims to be from {sender}")
+            self.trace("RECEIVE", f"package {safe_display(result['msg_id'])[:64]} claims to be from {sender}")
             text = verify_and_decrypt(
                 package, self.username, self.keys, sender_keys["sign_public_pem"],
                 seen_ids=self.seen_ids, trace=self.trace,

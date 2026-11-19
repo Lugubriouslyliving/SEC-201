@@ -249,8 +249,8 @@ def _check_shape(package: dict) -> None:
     for field in ("msg_id", "sender", "recipient", "nonce", "ciphertext", "wrapped_key", "signature"):
         if not isinstance(package[field], str):
             raise TypeError(f"{field} must be a string")
-    if not 1 <= len(package["msg_id"]) <= 64:
-        raise ValueError("bad message ID")
+    if len(package["msg_id"]) != 32 or any(c not in "0123456789abcdef" for c in package["msg_id"]):
+        raise ValueError("message ID must be 32 lowercase hex characters")
     if len(b64d(package["nonce"])) != 12:
         raise ValueError("nonce must be 96 bits")
     if len(b64d(package["ciphertext"])) < 16:
